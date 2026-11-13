@@ -4,7 +4,7 @@ Overview and quick install: [README](../README.md).
 
 codexr is the Codex CLI counterpart of [agyr](https://github.com/luongtrz/agyr): it rotates between several ChatGPT accounts for the official OpenAI `codex` CLI, shows the real quota of each account, and ships a headless runner with usage-limit failover plus a git-worktree task wrapper for AI orchestrators.
 
-Works exclusively with the official `codex` binary by swapping authentication credentials back and forth between saved slots (`$CODEX_HOME/accounts/`). Both Linux and Windows are supported as first-class platforms using a unified file-based credential store (`$CODEX_HOME/auth.json`). No proxy is used, and it never reads or prints token contents.
+Works exclusively with the official `codex` binary by swapping authentication credentials back and forth between saved slots (`$CODEX_HOME/accounts/`). Linux and Windows (Git Bash) use the same file-based credential store (`$CODEX_HOME/auth.json`). Linux is the tested platform; the Windows layer has not been tried on a real Windows machine yet. No proxy is used, and it never reads or prints token contents.
 
 > Disclaimer: Switching between multiple ChatGPT accounts may violate OpenAI's terms of service or acceptable use policies for certain plans. You are solely responsible for how you use this tool. Use your own accounts, use in moderation, and be aware that there is no guarantee against account restrictions or enforcement actions.
 
