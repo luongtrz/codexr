@@ -206,12 +206,16 @@ is_auth_error() {
   local chunk="$1"
   [ -n "$chunk" ] || return 1
   grep -qiE "$AUTH_RE" <<<"$chunk" || return 1 # cheap pre-filter before parsing
-  {
+  # the text that may carry a login failure: error / turn.failed messages and plain (non-JSON) stderr lines. Collected into a
+  # variable first: under pipefail a grep that finds nothing, or a writer hit by SIGPIPE after "grep -q" matched, would fail it.
+  local errs
+  errs="$({
     grep '^{' <<<"$chunk" | jq -r '
       select((.type // .event // "") | test("^(error|turn\\.failed)$")) |
       (.message // .error.message // "")' 2>/dev/null
     grep -v '^{' <<<"$chunk"
-  } | grep -qiE "$AUTH_RE"
+  } || true)"
+  grep -qiE "$AUTH_RE" <<<"$errs"
 }
 
 extract_usage_message() {
