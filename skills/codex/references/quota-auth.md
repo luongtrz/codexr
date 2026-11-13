@@ -54,7 +54,7 @@ Auth error strings that indicate exit 4:
 - `codexr active`: prints the name of the active account slot.
 - `codexr forget [-f]`: removes live `auth.json` on this machine so the next run prompts for login.
 - `codexr test [-w] [<name>...]`: sends "Hi" to accounts to test/ping (1 real request per account, burns quota; **only when the user explicitly asks**).
-- `codexr run <args>` (or bare `codexr`): starts codex using the credentials of the active slot (default model `gpt-6-luna`, reasoning effort `max`).
+- `codexr run <args>` (or bare `codexr`): starts codex using the credentials of the active slot (default model `gpt-6-luna`, reasoning effort `xhigh`).
 
 Always report reset times to the user in **UTC+7** (`codexr` outputs in UTC+7 by default via `CODEXR_TZ`).
 

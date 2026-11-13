@@ -92,7 +92,7 @@ codexr help [command]        # Overview or details of one command
 
 - **`codex-run`**: Runs one `codex` task headless with automatic account rotation when one runs out of quota. Uses `codex exec --json`. On a usage-limit error, terminates codex immediately, sets account cooldown, switches to the next ready account whose weekly limit resets soonest, and resumes the same conversation (`codex exec resume <thread_id>`).
 - **`codex-task`**: Deterministic wrapper running one delegated implement task end to end in a dedicated git worktree (`<repo>/.worktrees/codex-<name>`, branch `codex/<name>`), checking scope and generating a compact summary.
-- **Default Model & Reasoning Effort**: Defaults to model `gpt-6-luna` with reasoning effort `max` (from `lib/defaults.sh`). Overridable per call with `--model` and `--effort`, or globally with `CODEXR_MODEL` and `CODEXR_EFFORT`.
+- **Default Model & Reasoning Effort**: Defaults to model `gpt-6-luna` with reasoning effort `xhigh` (from `lib/defaults.sh`). Overridable per call with `--model` and `--effort`, or globally with `CODEXR_MODEL` and `CODEXR_EFFORT`.
 
 ---
 

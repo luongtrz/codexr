@@ -36,7 +36,7 @@ The install scripts only create symlinks or wrappers; they never log in or read 
 ### Repository layout
 
 - `bin/`: the three entry-point commands (`codexr`, `codex-run`, `codex-task`), free of platform-specific code.
-- `lib/`: shared defaults (`defaults.sh`, defining default model `gpt-6-luna` and reasoning effort `max`).
+- `lib/`: shared defaults (`defaults.sh`, defining default model `gpt-6-luna` and reasoning effort `xhigh`).
 - `install.sh`: unified root installer (auto-detects OS via `uname -s`).
 - `platforms/linux/`: `platform.sh` (Linux invocation layer: `setsid`, detached execution) and `install.sh` (symlink installer).
 - `platforms/windows/`: `platform.sh` (Git Bash invocation layer: path conversion with `cygpath -m`, process tree termination with `taskkill`, CRLF handling for `jq`) and `install.sh` (writes bash and `.cmd` batch wrappers).
@@ -109,7 +109,7 @@ codexr swapui <n1> <n2>         # swap UI display order of two accounts in codex
 codexr swapui --reset           # restore default weekly reset display order in codexr list
 codexr test [-w] [name...]      # send "Hi" to accounts (1 real request each) to start 5-hour window (spends real quota)
 codexr forget [-f]              # drop current local login to sign in to another account; refuses if unsaved (-f to force)
-codexr run [codex args]         # start codex with selected account (defaults to model gpt-6-luna, reasoning effort max)
+codexr run [codex args]         # start codex with selected account (defaults to model gpt-6-luna, reasoning effort xhigh)
 codexr [codex args]             # shorthand for `codexr run [codex args]` (bare `codexr` launches interactive codex)
 codexr sync                     # internal: write live login back into its slot if refreshed
 codexr help [command]           # overview, or detailed help for one command (`codexr <command> --help` also works)
@@ -243,7 +243,7 @@ codex-run --prompt FILE --add-dir DIR --log FILE.jsonl [--model M] [--effort E] 
 - `--add-dir DIR`: workspace directory `codex` works in (passed as `-C DIR`).
 - `--log FILE`: path to the JSONL log file (audit trail).
 - `--model M`: model override (defaults to `gpt-6-luna` or `CODEXR_MODEL`).
-- `--effort E`: reasoning effort level override (defaults to `max` or `CODEXR_EFFORT`).
+- `--effort E`: reasoning effort level override (defaults to `xhigh` or `CODEXR_EFFORT`).
 - `--sandbox MODE`: sandbox mode: `read-only` or `workspace-write` (default `workspace-write`, override via `CODEX_RUN_SANDBOX`). Network access remains off inside the sandbox.
 - `--yolo`: bypass approvals and sandbox (`--dangerously-bypass-approvals-and-sandbox`).
 - `--conversation ID`: resume an existing conversation thread ID instead of starting fresh.
@@ -279,9 +279,9 @@ Multiple `codex-run` processes can run concurrently:
 ### Typical workflow
 
 1. Write the task specification to `<repo>/.codex-sessions/<task>.task.txt` (task description, plan, acceptance criteria).
-2. Run `codex-task run --name <task> --task <repo>/.codex-sessions/<task>.task.txt --scope 'paths' --model gpt-6-luna --effort max` in the background.
+2. Run `codex-task run --name <task> --task <repo>/.codex-sessions/<task>.task.txt --scope 'paths' --model gpt-6-luna --effort xhigh` in the background.
 3. Read `.codex-sessions/<task>.summary.txt` and inspect `git diff` in `.worktrees/codex-<task>`.
-4. For a correction round: write a follow-up task file and run `codex-task run --name <task> --resume --task fix.txt --scope 'paths' --model gpt-6-luna --effort max` (resumes the same conversation thread from `.codex-sessions/<task>.jsonl` and implies `--reuse-worktree --no-setup`).
+4. For a correction round: write a follow-up task file and run `codex-task run --name <task> --resume --task fix.txt --scope 'paths' --model gpt-6-luna --effort xhigh` (resumes the same conversation thread from `.codex-sessions/<task>.jsonl` and implies `--reuse-worktree --no-setup`).
 5. Reviewer verifies code and runs tests.
 6. Clean up with `codex-task rm <task> -f`.
 
@@ -359,7 +359,7 @@ Every `codex-task run` that completes summary output appends a tab-separated row
 | `CODEX_HOME` | `~/.codex` | Codex home and credential directory |
 | `CODEXR_BIN` | `codex` | Codex CLI binary name or path |
 | `CODEXR_MODEL` | `gpt-6-luna` | Default model for `codexr` and `codex-run` |
-| `CODEXR_EFFORT` | `max` | Default reasoning effort for `codexr` and `codex-run` |
+| `CODEXR_EFFORT` | `xhigh` | Default reasoning effort for `codexr` and `codex-run` |
 | `CODEXR_TZ` | `UTC-7` (UTC+7) | Time zone for displayed timestamps |
 | `CODEXR_NOW` | current epoch | Test hook: override current epoch timestamp |
 | `CODEXR_COLOR` | `auto` | Table colour output: `auto`, `always`, or `never` |

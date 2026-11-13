@@ -13,7 +13,7 @@
 #   CODEX_HOME            codex data directory (default ~/.codex)
 #   CODEXR_BIN           codex binary (default codex)
 #   CODEXR_MODEL         override default model (default gpt-6-luna)
-#   CODEXR_EFFORT        override default reasoning effort (default max)
+#   CODEXR_EFFORT        override default reasoning effort (default xhigh)
 #   CODEX_RUN_POLL       seconds between two looks at the log (default 1)
 #   CODEX_RUN_MAX_SWITCH maximum number of account switches (default 10)
 #   CODEX_RUN_SANDBOX    default sandbox mode (default workspace-write)

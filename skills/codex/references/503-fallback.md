@@ -2,7 +2,7 @@
 
 Read this when a `codex-run` or `codex-task` session ends with a server error, stream timeout, or unexpected failure (exit code 1), or when a running session appears stalled.
 
-Unlike usage-limit errors (which trigger automatic account rotation to another slot in the pool), server-side errors or capacity issues (e.g. HTTP 500, 502, 503, 504, or stream disconnects) are upstream service issues. Codex shares a single quota pool across models, and default model `gpt-6-luna` with reasoning effort `max` remains the standard configuration; do NOT switch models on an outage unless the user explicitly instructs you to do so.
+Unlike usage-limit errors (which trigger automatic account rotation to another slot in the pool), server-side errors or capacity issues (e.g. HTTP 500, 502, 503, 504, or stream disconnects) are upstream service issues. Codex shares a single quota pool across models, and default model `gpt-6-luna` with reasoning effort `xhigh` remains the standard configuration; do NOT switch models on an outage unless the user explicitly instructs you to do so.
 
 ## When to retry
 

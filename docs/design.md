@@ -15,7 +15,7 @@ This file is the shared contract: every area of the code follows the decisions b
 ## 1. Binary, model, effort
 
 - Binary: `codex` (override `CODEXR_BIN`). Tested against codex-cli 0.167.x.
-- Default model **`gpt-6-luna`** with reasoning effort **`max`**. The values live in `lib/defaults.sh` (`CODEXR_DEFAULT_MODEL`, `CODEXR_DEFAULT_EFFORT`, overridable with `CODEXR_MODEL` / `CODEXR_EFFORT`) and are sourced by all three commands; never hard-code the literals elsewhere.
+- Default model **`gpt-6-luna`** with reasoning effort **`xhigh`**. The values live in `lib/defaults.sh` (`CODEXR_DEFAULT_MODEL`, `CODEXR_DEFAULT_EFFORT`, overridable with `CODEXR_MODEL` / `CODEXR_EFFORT`) and are sourced by all three commands; never hard-code the literals elsewhere.
 - Every codex call passes `-m <model> -c model_reasoning_effort="<effort>"` explicitly, so the user's `~/.codex/config.toml` default never leaks in. `--model` / `--effort` flags override per call.
 
 ## 2. Login store (one backend, all platforms)

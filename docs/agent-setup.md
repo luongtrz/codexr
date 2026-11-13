@@ -31,7 +31,7 @@ The main agent does NOT write or edit project code itself — **except** when it
 - Implement tasks go through `codex-task run`
 - Read-only exploration tasks go through `codex-run --sandbox read-only`
 
-Before any `codex` run, load and follow the `codex` skill (`SKILL.md`): default model `gpt-6-luna` with reasoning effort `max` (overridable with `--model` / `--effort` or `CODEXR_MODEL` / `CODEXR_EFFORT`), flags, exit codes, usage-limit rotation, and git worktree rules all live there. If `codex` is unavailable (login failure or the whole account pool is on cooldown), STOP and tell the user so they can re-login — do not silently fall back to coding it yourself.
+Before any `codex` run, load and follow the `codex` skill (`SKILL.md`): default model `gpt-6-luna` with reasoning effort `xhigh` (overridable with `--model` / `--effort` or `CODEXR_MODEL` / `CODEXR_EFFORT`), flags, exit codes, usage-limit rotation, and git worktree rules all live there. If `codex` is unavailable (login failure or the whole account pool is on cooldown), STOP and tell the user so they can re-login — do not silently fall back to coding it yourself.
 
 Orchestrator responsibilities:
 - **Plan, don't over-specify** — do only enough investigation to write a clear plan: goal, root cause or suspected area, relevant files, the pattern to mirror, and acceptance criteria. Do NOT pre-trace every line or write out the full code in the prompt — let `codex` locate and implement the details, then trace the code during review. Keep one bug or logical change per `codex` session; every prompt carries the `HARD RULES` block (`codex-task` appends it automatically).
