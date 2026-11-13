@@ -1,0 +1,890 @@
+#!/usr/bin/env bash
+# codex-task — deterministic wrapper running one delegated implement task end to end.
+#
+# Usage:
+#   codex-task run --name NAME --task FILE [options]
+#   codex-task rm NAME [-f] [--repo DIR]
+#   codex-task --help          (also printed with no arguments)
+#
+# Options of `run`:
+#   --name NAME         [a-z0-9-]+ . Worktree <repo>/.worktrees/codex-NAME, branch codex/NAME,
+#                       session files <repo>/.codex-sessions/NAME.* (required)
+#   --task FILE         file with ONLY the task part of the prompt (required)
+#   --repo DIR          main checkout (default: repo of current directory, or main checkout
+#                       if inside a linked worktree)
+#   --base REF          commit-ish the branch starts from (default: HEAD)
+#   --scope PATHSPEC    repeatable; paths codex may change (relative to worktree root)
+#   --allow-path PATH   repeatable; lets codex touch a normally forbidden path
+#   --no-setup          skip SETUP_CMDS and COPY_FILES
+#   --reuse-worktree    use an existing worktree instead of failing
+#   --resume            resume previous codex conversation (implies --reuse-worktree --no-setup)
+#   --model M           model passed through to codex-run
+#   --effort E          reasoning effort passed through to codex-run
+#
+# Options of `rm`:
+#   NAME                [a-z0-9-]+ task name to remove (required)
+#   -f, --force         force removal even if dirty or unmerged
+#   --repo DIR          main checkout (default: repo of current directory; resolves
+#                       linked worktree to main checkout)
+#
+# Exit codes:
+#   0 success (for run: codex-run succeeded, no scope violation; for rm: removed)
+#   1, 4, 5, 6 codex-run failure codes (propagated unchanged)
+#   2 bad arguments / config error / rm refused / resume error
+#   7 setup failure
+#   8 scope violation
+#
+# Environment variables:
+#   CODEX_RUN        path of codex-run (default: sibling of this script)
+#   CODEX_TASK_CONF  config path override (default: <repo>/.codex-sessions/codex-task.conf)
+set -uo pipefail
+
+BIN_DIR="$(dirname "$(readlink -f "$0")")"
+if [ -z "${CODEX_RUN:-}" ]; then
+  if [ -x "$BIN_DIR/codex-run" ]; then
+    CODEX_RUN="$BIN_DIR/codex-run"
+  elif command -v codex-run >/dev/null 2>&1; then
+    CODEX_RUN="$(command -v codex-run)"
+  else
+    CODEX_RUN="$BIN_DIR/codex-run"
+  fi
+fi
+TEMPLATES_DIR="$(dirname "$BIN_DIR")/templates"
+
+log() { echo "[codex-task] $*" >&2; }
+die() { log "$1"; exit "${2:-1}"; }
+
+usage() {
+  cat <<'EOF'
+codex-task — deterministic wrapper running one delegated implement task end to end
+
+Usage:
+  codex-task run --name NAME --task FILE [options]
+  codex-task rm NAME [-f] [--repo DIR]
+  codex-task --help
+
+Options of `run`:
+  --name NAME         [a-z0-9-]+ . Worktree <repo>/.worktrees/codex-NAME, branch codex/NAME,
+                      session files <repo>/.codex-sessions/NAME.* (required)
+  --task FILE         file with ONLY the task part of the prompt (required)
+  --repo DIR          main checkout (default: repo of current directory; resolves
+                      linked worktree to main checkout)
+  --base REF          commit-ish the branch starts from (default: HEAD)
+  --scope PATHSPEC    repeatable; paths codex may change (relative to worktree root)
+  --allow-path PATH   repeatable; lets codex touch a normally forbidden path
+  --no-setup          skip SETUP_CMDS and COPY_FILES
+  --reuse-worktree    use an already existing worktree instead of failing
+  --resume            resume previous codex conversation (implies --reuse-worktree --no-setup)
+  --model M           passed through to codex-run
+  --effort E          passed through to codex-run
+
+Options of `rm`:
+  NAME                [a-z0-9-]+ task name to remove (required)
+  -f, --force         force removal even if dirty or unmerged
+  --repo DIR          main checkout (default: repo of current directory; resolves
+                      linked worktree to main checkout)
+
+Exit codes:
+  0 success | 1, 4, 5, 6 codex-run exit code | 2 bad arguments, config error, rm refused, or resume error |
+  7 setup failure | 8 scope violation
+EOF
+}
+
+# Resolve main repository
+resolve_repo() {
+  local target_dir="${1:-.}"
+  [ -d "$target_dir" ] || die "--repo must be an existing directory: $target_dir" 2
+  local common_dir
+  common_dir="$(git -C "$target_dir" rev-parse --git-common-dir 2>/dev/null)" || die "not a git repository: $target_dir" 2
+  if [[ "$common_dir" != /* ]]; then
+    common_dir="$(cd "$target_dir" && cd "$common_dir" && pwd)"
+  else
+    common_dir="$(readlink -f "$common_dir")"
+  fi
+  MAIN_REPO="$(dirname "$common_dir")"
+  MAIN_REPO="$(readlink -f "$MAIN_REPO")"
+}
+
+cmd_rm() {
+  local NAME=""
+  local FORCE=false
+  local REPO_ARG="."
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force)
+        FORCE=true
+        shift
+        ;;
+      --repo)
+        [ $# -ge 2 ] || die "missing argument for --repo" 2
+        REPO_ARG="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        die "unknown argument: $1 (see --help)" 2
+        ;;
+      *)
+        if [ -z "$NAME" ]; then
+          NAME="$1"
+        else
+          die "unexpected argument: $1 (see --help)" 2
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$NAME" ] || die "missing required NAME" 2
+  [[ "$NAME" =~ ^[a-z0-9-]+$ ]] || die "invalid name '$NAME': must match [a-z0-9-]+" 2
+
+  resolve_repo "$REPO_ARG"
+
+  local WORKTREE_DIR="$MAIN_REPO/.worktrees/codex-$NAME"
+  local BRANCH_NAME="codex/$NAME"
+  local PROMPT_FILE="$MAIN_REPO/.codex-sessions/$NAME.prompt.txt"
+
+  local wt_exists=false
+  local br_exists=false
+
+  if [ -e "$WORKTREE_DIR" ]; then
+    wt_exists=true
+  fi
+
+  if git -C "$MAIN_REPO" show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    br_exists=true
+  fi
+
+  if [ "$wt_exists" = false ] && [ "$br_exists" = false ]; then
+    die "nothing to remove for '$NAME'" 2
+  fi
+
+  # Prune any stale worktree administrative metadata if directory does not exist on disk
+  if [ "$wt_exists" = false ]; then
+    git -C "$MAIN_REPO" worktree prune 2>/dev/null || true
+  fi
+
+  # Without -f: refuse if worktree is dirty / untracked, or branch has unmerged commits
+  if [ "$FORCE" = false ]; then
+    if [ "$wt_exists" = true ]; then
+      local wt_status
+      wt_status="$(git -C "$WORKTREE_DIR" status --porcelain=v1 2>/dev/null)" || true
+      if [ -n "$wt_status" ]; then
+        die "worktree $WORKTREE_DIR has uncommitted changes or untracked files (use -f to override)" 2
+      fi
+    fi
+
+    if [ "$br_exists" = true ]; then
+      local main_head
+      main_head="$(git -C "$MAIN_REPO" rev-parse HEAD 2>/dev/null)" || die "cannot resolve HEAD in $MAIN_REPO" 2
+      if ! git -C "$MAIN_REPO" merge-base --is-ancestor "refs/heads/$BRANCH_NAME" "$main_head" 2>/dev/null; then
+        die "branch $BRANCH_NAME has commits not reachable from main checkout HEAD (use -f to override)" 2
+      fi
+    fi
+  fi
+
+  local wt_removed=false
+  local br_removed=false
+
+  if [ "$wt_exists" = true ]; then
+    log "removing worktree $WORKTREE_DIR"
+    local wt_err
+    if [ "$FORCE" = true ]; then
+      wt_err="$(git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_DIR" 2>&1)" || die "failed to remove worktree: $wt_err" 2
+    else
+      wt_err="$(git -C "$MAIN_REPO" worktree remove "$WORKTREE_DIR" 2>&1)" || die "failed to remove worktree: $wt_err" 2
+    fi
+    wt_removed=true
+  fi
+
+  if [ "$br_exists" = true ]; then
+    log "removing branch $BRANCH_NAME"
+    local br_err
+    if [ "$FORCE" = true ]; then
+      br_err="$(git -C "$MAIN_REPO" branch -D "$BRANCH_NAME" 2>&1)" || die "failed to delete branch: $br_err" 2
+    else
+      br_err="$(git -C "$MAIN_REPO" branch -d "$BRANCH_NAME" 2>&1)" || die "failed to delete branch: $br_err" 2
+    fi
+    br_removed=true
+  fi
+
+  if [ -f "$PROMPT_FILE" ]; then
+    log "removing prompt file $PROMPT_FILE"
+    rm -f "$PROMPT_FILE"
+  fi
+
+  if [ "$wt_removed" = true ] && [ "$br_removed" = true ]; then
+    echo "removed: worktree $WORKTREE_DIR, branch $BRANCH_NAME"
+  elif [ "$wt_removed" = true ]; then
+    echo "removed: worktree $WORKTREE_DIR"
+  elif [ "$br_removed" = true ]; then
+    echo "removed: branch $BRANCH_NAME"
+  fi
+
+  exit 0
+}
+
+# Config variables (sourceable at top level)
+SETUP_CMDS=()
+COPY_FILES=()
+
+# Bare command or help
+if [ $# -eq 0 ]; then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  run)
+    shift
+    ;;
+  rm)
+    shift
+    cmd_rm "$@"
+    ;;
+  *)
+    die "unknown command: $1 (see --help)" 2
+    ;;
+esac
+
+NAME=""
+TASK_FILE=""
+REPO_ARG="."
+BASE_REF="HEAD"
+SCOPE_LIST=()
+ALLOW_PATHS=()
+NO_SETUP=false
+REUSE_WORKTREE=false
+RESUME=false
+MODEL=""
+EFFORT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name)
+      [ $# -ge 2 ] || die "missing argument for --name" 2
+      NAME="$2"; shift 2 ;;
+    --task)
+      [ $# -ge 2 ] || die "missing argument for --task" 2
+      TASK_FILE="$2"; shift 2 ;;
+    --repo)
+      [ $# -ge 2 ] || die "missing argument for --repo" 2
+      REPO_ARG="$2"; shift 2 ;;
+    --base)
+      [ $# -ge 2 ] || die "missing argument for --base" 2
+      BASE_REF="$2"; shift 2 ;;
+    --scope)
+      [ $# -ge 2 ] || die "missing argument for --scope" 2
+      SCOPE_LIST+=("$2"); shift 2 ;;
+    --allow-path)
+      [ $# -ge 2 ] || die "missing argument for --allow-path" 2
+      ALLOW_PATHS+=("$2"); shift 2 ;;
+    --no-setup)
+      NO_SETUP=true; shift ;;
+    --reuse-worktree)
+      REUSE_WORKTREE=true; shift ;;
+    --resume)
+      RESUME=true; shift ;;
+    --model)
+      [ $# -ge 2 ] || die "missing argument for --model" 2
+      MODEL="$2"; shift 2 ;;
+    --effort)
+      [ $# -ge 2 ] || die "missing argument for --effort" 2
+      EFFORT="$2"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      die "unknown argument: $1 (see --help)" 2 ;;
+  esac
+done
+
+if [ "$RESUME" = true ]; then
+  REUSE_WORKTREE=true
+  NO_SETUP=true
+fi
+
+# Validate required arguments
+[ -n "$NAME" ] || die "missing required --name" 2
+[[ "$NAME" =~ ^[a-z0-9-]+$ ]] || die "invalid name '$NAME': must match [a-z0-9-]+" 2
+
+[ -n "$TASK_FILE" ] || die "missing required --task" 2
+[ -f "$TASK_FILE" ] || die "--task must be an existing file: $TASK_FILE" 2
+TASK_FILE="$(readlink -f "$TASK_FILE")"
+
+# Resolve main repository
+resolve_repo "$REPO_ARG"
+
+# Source config file at top level
+if [ -n "${CODEX_TASK_CONF:-}" ]; then
+  CONF_FILE="$CODEX_TASK_CONF"
+else
+  CONF_FILE="$MAIN_REPO/.codex-sessions/codex-task.conf"
+fi
+
+if [ -f "$CONF_FILE" ]; then
+  # Sourced at top level
+  # shellcheck source=/dev/null
+  source "$CONF_FILE"
+else
+  log "warning: no config file found at $CONF_FILE (no setup, no copy)"
+fi
+
+WORKTREE_DIR="$MAIN_REPO/.worktrees/codex-$NAME"
+BRANCH_NAME="codex/$NAME"
+SESSIONS_DIR="$MAIN_REPO/.codex-sessions"
+PROMPT_FILE="$SESSIONS_DIR/$NAME.prompt.txt"
+SETUP_LOG="$SESSIONS_DIR/$NAME.setup.log"
+LOG_FILE="$SESSIONS_DIR/$NAME.jsonl"
+SUMMARY_FILE="$SESSIONS_DIR/$NAME.summary.txt"
+
+RESUME_THREAD_ID=""
+if [ "$RESUME" = true ]; then
+  [ -f "$LOG_FILE" ] || die "cannot resume: session log not found: $LOG_FILE" 2
+  last_started="$(grep -E '"(type|event)"[[:space:]]*:[[:space:]]*"thread\.started"' "$LOG_FILE" 2>/dev/null | tail -1 || true)"
+  if [ -z "$last_started" ]; then
+    last_started="$(grep '^{' "$LOG_FILE" 2>/dev/null | jq -c 'select((.type // .event) == "thread.started")' 2>/dev/null | tail -1 || true)"
+  fi
+  if [ -n "$last_started" ]; then
+    RESUME_THREAD_ID="$(jq -r '.thread_id // empty' <<<"$last_started" 2>/dev/null || true)"
+  fi
+  if [ -z "$RESUME_THREAD_ID" ]; then
+    last_init="$(grep '^{' "$LOG_FILE" 2>/dev/null | jq -c 'select(.event=="init")' 2>/dev/null | tail -1 || true)"
+    if [ -n "$last_init" ]; then
+      RESUME_THREAD_ID="$(jq -r '.conversation_id // empty' <<<"$last_init" 2>/dev/null || true)"
+    fi
+  fi
+  [ -n "$RESUME_THREAD_ID" ] || die "cannot resume: no thread id found in $LOG_FILE (no conversation id found)" 2
+fi
+
+# Step 1: Worktree / branch conflict validation
+if [ -e "$WORKTREE_DIR" ]; then
+  if [ "$REUSE_WORKTREE" = false ]; then
+    die "worktree already exists: $WORKTREE_DIR (use --reuse-worktree to reuse)" 2
+  fi
+  if [ ! -d "$WORKTREE_DIR" ] || [ "$(git -C "$WORKTREE_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ] || [ "$(readlink -f "$(git -C "$WORKTREE_DIR" rev-parse --show-toplevel 2>/dev/null)")" != "$(readlink -f "$WORKTREE_DIR")" ]; then
+    die "existing path is not a git worktree: $WORKTREE_DIR" 2
+  fi
+  wt_common_dir="$(git -C "$WORKTREE_DIR" rev-parse --git-common-dir 2>/dev/null)" || die "failed to resolve git-common-dir for $WORKTREE_DIR" 2
+  if [[ "$wt_common_dir" != /* ]]; then
+    wt_common_dir="$(cd "$WORKTREE_DIR" && cd "$wt_common_dir" && pwd)"
+  else
+    wt_common_dir="$(readlink -f "$wt_common_dir")"
+  fi
+  wt_repo="$(readlink -f "$(dirname "$wt_common_dir")")"
+  if [ "$wt_repo" != "$MAIN_REPO" ]; then
+    die "worktree $WORKTREE_DIR does not belong to main repository: $wt_repo (expected $MAIN_REPO)" 2
+  fi
+fi
+
+if git -C "$MAIN_REPO" show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+  if [ ! -e "$WORKTREE_DIR" ]; then
+    die "branch $BRANCH_NAME exists while worktree $WORKTREE_DIR does not" 2
+  fi
+fi
+
+mkdir -p "$SESSIONS_DIR"
+
+# Step 2: Create worktree
+# When BASE_REF is "HEAD" (default), resolve it from the directory where codex-task was invoked ($REPO_ARG),
+# NOT from $MAIN_REPO. If invoked from a linked worktree, HEAD in $REPO_ARG reflects that worktree's commit,
+# preventing tasks from accidentally branching off an unrelated branch checked out in $MAIN_REPO.
+if [ "$BASE_REF" = "HEAD" ]; then
+  BASE_SHA="$(git -C "$REPO_ARG" rev-parse --short HEAD 2>/dev/null)" || \
+  BASE_SHA="$(git -C "$MAIN_REPO" rev-parse --short HEAD 2>/dev/null)" || die "invalid base ref: $BASE_REF" 2
+  BASE_REF="$BASE_SHA"
+else
+  BASE_SHA="$(git -C "$MAIN_REPO" rev-parse --short "$BASE_REF" 2>/dev/null)" || die "invalid base ref: $BASE_REF" 2
+fi
+
+if [ ! -e "$WORKTREE_DIR" ]; then
+  mkdir -p "$MAIN_REPO/.worktrees"
+  wt_err="$(git -C "$MAIN_REPO" worktree add --no-track -b "$BRANCH_NAME" "$WORKTREE_DIR" "$BASE_REF" 2>&1)" || {
+    log "failed to create worktree $WORKTREE_DIR:"
+    printf '%s\n' "$wt_err" | tail -n 20 >&2
+    exit 2
+  }
+fi
+log "base: $BASE_REF ($BASE_SHA)"
+
+# Helper for file hashes
+get_file_hash() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    sha256sum "$f" | cut -d' ' -f1
+  elif [ -e "$f" ]; then
+    sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || echo "__EXISTS__"
+  else
+    echo "__MISSING__"
+  fi
+}
+
+# Helper to log usage
+write_usage_log() {
+  local exit_code="$1"
+  local usage_file="$MAIN_REPO/.codex-sessions/usage.tsv"
+  {
+    mkdir -p "$(dirname "$usage_file")" || return 0
+    if [ ! -f "$usage_file" ]; then
+      printf 'timestamp\tname\tresult\tcodex_status\tturns\ttokens\tcodex_seconds\texit_code\n' >> "$usage_file" || return 0
+    fi
+    local ts
+    ts="$(date -Is 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z)"
+    local res_token="${RESULT_LINE%% *}"
+    local u_status="-"
+    local u_turns="-"
+    local u_tokens="-"
+    local u_secs="-"
+
+    if [ "$CODEX_STATUS" = "not run" ]; then
+      u_status="not run"
+    elif [ -n "$CODEX_STATUS" ] && [ "$CODEX_STATUS" != "unknown" ]; then
+      u_status="$CODEX_STATUS"
+    fi
+
+    if [ -n "$NUM_TURNS" ] && [ "$NUM_TURNS" != "none" ] && [ "$NUM_TURNS" != "unknown" ]; then
+      u_turns="$NUM_TURNS"
+    fi
+
+    if [ -n "$TOTAL_TOKENS" ] && [ "$TOTAL_TOKENS" != "none" ] && [ "$TOTAL_TOKENS" != "unknown" ]; then
+      u_tokens="$TOTAL_TOKENS"
+    fi
+
+    if [ "$CODEX_STATUS" != "not run" ] && [ -n "$CODEX_ELAPSED" ]; then
+      u_secs="$CODEX_ELAPSED"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$ts" "$NAME" "$res_token" "$u_status" "$u_turns" "$u_tokens" "$u_secs" "$exit_code" >> "$usage_file"
+  } 2>/dev/null || true
+}
+
+# Helper to write summary and print to stdout
+# Globals used: RESULT_LINE, WORKTREE_DIR, BRANCH_NAME, BASE_REF, BASE_SHA,
+# CODEX_STATUS, NUM_TURNS, TOTAL_TOKENS, CACHED_TOKENS, CODEX_ELAPSED, CODEX_RC, CODEX_RESPONSE,
+# CHANGED_DIFF_STAT, UNTRACKED_CHANGED, SCOPE_SUMMARY_LINES,
+# SUMMARY_FILE, LOG_FILE, SETUP_LOG
+write_and_print_summary() {
+  local exit_code="${1:-0}"
+  {
+    echo "$RESULT_LINE"
+    echo "worktree: $WORKTREE_DIR"
+    echo "branch:   $BRANCH_NAME"
+    echo "base:     $BASE_REF ($BASE_SHA)"
+    
+    # codex status line
+    if [ "$CODEX_STATUS" = "not run" ]; then
+      echo "codex:    not run"
+    else
+      local codex_note=""
+      if [ "$CODEX_STATUS" = "ERROR" ] && [ "$CODEX_RC" -eq 0 ]; then
+        codex_note=" - codex reported ERROR - check the diff before trusting it"
+      fi
+      local token_str="${TOTAL_TOKENS:-unknown}"
+      if [ -n "$CACHED_TOKENS" ] && [ "$CACHED_TOKENS" != "0" ] && [ "$CACHED_TOKENS" != "none" ]; then
+        token_str="${token_str} (${CACHED_TOKENS} cached)"
+      fi
+      echo "codex:    status=${CODEX_STATUS:-unknown}, turns=${NUM_TURNS:-unknown}, tokens=${token_str} (${CODEX_ELAPSED}s)${codex_note}"
+    fi
+
+    # changed files
+    echo "changed files:"
+    local has_changed=false
+    if [ -n "$CHANGED_DIFF_STAT" ]; then
+      echo "$CHANGED_DIFF_STAT"
+      has_changed=true
+    fi
+    if [ ${#UNTRACKED_CHANGED[@]} -gt 0 ]; then
+      for u in "${UNTRACKED_CHANGED[@]}"; do
+        echo "?? $u"
+      done
+      has_changed=true
+    fi
+    if [ "$has_changed" = false ]; then
+      echo "(none)"
+    fi
+
+    # scope
+    for sl in "${SCOPE_SUMMARY_LINES[@]}"; do
+      echo "$sl"
+    done
+
+    # codex report
+    echo "codex report:"
+    if [ -n "$CODEX_RESPONSE" ]; then
+      local total_lines
+      total_lines="$(printf '%s\n' "$CODEX_RESPONSE" | wc -l)"
+      if [ "$total_lines" -gt 25 ]; then
+        printf '%s\n' "$CODEX_RESPONSE" | head -n 25
+        local remaining=$((total_lines - 25))
+        echo "... ($remaining more lines, see $LOG_FILE)"
+      else
+        printf '%s\n' "$CODEX_RESPONSE"
+      fi
+    else
+      echo "(none)"
+    fi
+
+    # logs
+    echo "logs:"
+    [ -f "$LOG_FILE" ] && echo "  jsonl:  $LOG_FILE"
+    [ -f "$SETUP_LOG" ] && echo "  setup:  $SETUP_LOG"
+  } > "$SUMMARY_FILE"
+  cat "$SUMMARY_FILE"
+  write_usage_log "$exit_code"
+}
+
+# State variables for summary
+CODEX_STATUS="not run"
+NUM_TURNS="none"
+TOTAL_TOKENS="none"
+CACHED_TOKENS="none"
+CODEX_ELAPSED=0
+CODEX_RC=0
+CODEX_RESPONSE=""
+CHANGED_DIFF_STAT=""
+CHANGED_PATHS=()
+UNTRACKED_CHANGED=()
+SCOPE_SUMMARY_LINES=()
+declare -A CURRENT_STATUS=()
+declare -A ALL_CURRENT_PATHS=()
+
+# Step 3: Setup (unless --no-setup)
+: > "$SETUP_LOG"
+if [ "$NO_SETUP" = false ]; then
+  for scmd in "${SETUP_CMDS[@]}"; do
+    log "setup: $scmd"
+    tmp_out="$(mktemp)"
+    (cd "$WORKTREE_DIR" && bash -c "$scmd") >"$tmp_out" 2>&1
+    sc_rc=$?
+    cat "$tmp_out" >> "$SETUP_LOG"
+    if [ $sc_rc -ne 0 ]; then
+      log "setup command failed: $scmd"
+      tail -n 30 "$tmp_out" >&2
+      rm -f "$tmp_out"
+      RESULT_LINE="RESULT=SETUP_FAILED (command exited $sc_rc)"
+      SCOPE_SUMMARY_LINES=("scope: not checked (setup failed)")
+      write_and_print_summary 7
+      exit 7
+    fi
+    rm -f "$tmp_out"
+  done
+
+  for rel in "${COPY_FILES[@]}"; do
+    src="$MAIN_REPO/$rel"
+    dst="$WORKTREE_DIR/$rel"
+    if [ -f "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp "$src" "$dst"
+      echo "copied $rel" >> "$SETUP_LOG"
+    elif [ -e "$src" ]; then
+      mkdir -p "$(dirname "$dst")"
+      cp -r "$src" "$dst"
+      echo "copied $rel" >> "$SETUP_LOG"
+    else
+      log "warning: copy source missing: $rel"
+      echo "warning: copy source missing: $rel" >> "$SETUP_LOG"
+    fi
+  done
+fi
+
+START_HEAD="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
+
+# Step 4: Baseline content hashes of modified/untracked files
+declare -A BASELINE_HASHES=()
+while IFS= read -r -d '' entry; do
+  [ -z "$entry" ] && continue
+  xy="${entry:0:2}"
+  p="${entry:3}"
+  if [[ "${xy:0:1}" =~ [RC] || "${xy:1:1}" =~ [RC] ]]; then
+    read -r -d '' orig_p
+    BASELINE_HASHES["$orig_p"]="$(get_file_hash "$WORKTREE_DIR/$orig_p")"
+  fi
+  BASELINE_HASHES["$p"]="$(get_file_hash "$WORKTREE_DIR/$p")"
+done < <(git -C "$WORKTREE_DIR" status --porcelain=v1 -z -uall)
+
+# Step 5: Build prompt
+HR_FILE="$MAIN_REPO/.codex-sessions/hard-rules.txt"
+if [ ! -f "$HR_FILE" ]; then
+  HR_FILE="$TEMPLATES_DIR/hard-rules.txt"
+fi
+[ -f "$HR_FILE" ] || die "hard-rules template not found: $HR_FILE" 2
+
+{
+  echo "Working directory: $WORKTREE_DIR."
+  echo
+  cat "$TASK_FILE"
+  echo
+  echo "Scope:"
+  if [ ${#SCOPE_LIST[@]} -gt 0 ]; then
+    for s in "${SCOPE_LIST[@]}"; do
+      echo "- $s"
+    done
+  else
+    echo "none given"
+  fi
+  echo
+  sed "s|<ABS_PATH>|$WORKTREE_DIR|g" "$HR_FILE"
+  echo
+  echo "Do NOT run any test, build, type-check or lint command yourself, not even a single test file: it lags the machine. Only read and edit code, then report. The reviewer runs all verification after you finish."
+} > "$PROMPT_FILE"
+
+# Helper to compute changed files and diff stat against START_HEAD
+compute_changed_files() {
+  CURRENT_STATUS=()
+  ALL_CURRENT_PATHS=()
+  while IFS= read -r -d '' entry; do
+    [ -z "$entry" ] && continue
+    xy="${entry:0:2}"
+    p="${entry:3}"
+    if [[ "${xy:0:1}" =~ [RC] || "${xy:1:1}" =~ [RC] ]]; then
+      read -r -d '' orig_p
+      CURRENT_STATUS["$orig_p"]="$xy"
+      ALL_CURRENT_PATHS["$orig_p"]=1
+    fi
+    CURRENT_STATUS["$p"]="$xy"
+    ALL_CURRENT_PATHS["$p"]=1
+  done < <(git -C "$WORKTREE_DIR" status --porcelain=v1 -z -uall)
+
+  while IFS= read -r -d '' p; do
+    [ -z "$p" ] && continue
+    ALL_CURRENT_PATHS["$p"]=1
+  done < <(git -C "$WORKTREE_DIR" diff --name-only -z "$START_HEAD")
+
+  CHANGED_PATHS=()
+  for p in "${!ALL_CURRENT_PATHS[@]}"; do
+    curr_hash="$(get_file_hash "$WORKTREE_DIR/$p")"
+    if [ -n "${BASELINE_HASHES[$p]+_}" ]; then
+      base_hash="${BASELINE_HASHES[$p]}"
+      if [ "$curr_hash" = "$base_hash" ]; then
+        continue
+      fi
+    fi
+    CHANGED_PATHS+=("$p")
+  done
+
+  if [ ${#CHANGED_PATHS[@]} -gt 0 ]; then
+    mapfile -t CHANGED_PATHS < <(for p in "${CHANGED_PATHS[@]}"; do echo "$p"; done | sort)
+  fi
+
+  CHANGED_DIFF_STAT="$(git -C "$WORKTREE_DIR" diff --stat "$START_HEAD" 2>/dev/null || true)"
+  UNTRACKED_CHANGED=()
+  for p in "${CHANGED_PATHS[@]}"; do
+    if [ "${CURRENT_STATUS[$p]:-}" = "??" ]; then
+      UNTRACKED_CHANGED+=("$p")
+    fi
+  done
+}
+
+# Step 6: Run codex-run
+CODEX_STATUS=""
+log "running codex-run..."
+codex_cmd=("$CODEX_RUN" --prompt "$PROMPT_FILE" --add-dir "$WORKTREE_DIR" --log "$LOG_FILE")
+if [ -n "$MODEL" ]; then
+  codex_cmd+=(--model "$MODEL")
+fi
+if [ -n "$EFFORT" ]; then
+  codex_cmd+=(--effort "$EFFORT")
+fi
+if [ -n "$RESUME_THREAD_ID" ]; then
+  codex_cmd+=(--conversation "$RESUME_THREAD_ID")
+fi
+
+codex_start=$SECONDS
+"${codex_cmd[@]}" >&2
+CODEX_RC=$?
+CODEX_ELAPSED=$((SECONDS - codex_start))
+
+# Extract result from codex JSONL log if available
+if [ -f "$LOG_FILE" ]; then
+  parsed_json="$(grep '^{' "$LOG_FILE" 2>/dev/null | jq -s -c '
+    [ .[] | select(. != null and type == "object") ] |
+    reduce .[] as $item (
+      {
+        has_turn_completed: false,
+        error_after_turn: false,
+        turns: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        last_message: "",
+        is_codex: false,
+        legacy_status: null,
+        legacy_turns: null,
+        legacy_tokens: null,
+        legacy_response: null
+      };
+      ($item.type // $item.event // "") as $t |
+      if $t == "turn.completed" then
+        . + {
+          is_codex: true,
+          has_turn_completed: true,
+          error_after_turn: false,
+          turns: (.turns + 1),
+          input_tokens: (.input_tokens + ($item.usage.input_tokens // 0)),
+          output_tokens: (.output_tokens + ($item.usage.output_tokens // 0)),
+          cached_tokens: (.cached_tokens + ($item.usage.cached_input_tokens // 0))
+        }
+      elif $t == "error" or $t == "turn.failed" then
+        . + {
+          is_codex: true,
+          error_after_turn: true
+        }
+      elif $t == "thread.started" or $t == "turn.started" then
+        . + { is_codex: true }
+      elif $t == "item.completed" and (($item.item.type // $item.item_type // "") == "agent_message") then
+        . + {
+          is_codex: true,
+          last_message: ($item.item.text // $item.text // "")
+        }
+      elif $t == "result" and ($item.result != null) then
+        . + {
+          legacy_status: ($item.result.status // ""),
+          legacy_turns: ($item.result.num_turns // 0),
+          legacy_tokens: ($item.result.usage.total_tokens // 0),
+          legacy_response: ($item.result.response // "")
+        }
+      else
+        .
+      end
+    ) |
+    if .is_codex then
+      {
+        status: (if .has_turn_completed and (.error_after_turn | not) then "OK" else "ERROR" end),
+        turns: .turns,
+        total_tokens: (.input_tokens + .output_tokens),
+        cached_tokens: .cached_tokens,
+        response: .last_message
+      }
+    elif .legacy_status != null then
+      {
+        status: (if .legacy_status == "SUCCESS" then "OK" else .legacy_status end),
+        turns: .legacy_turns,
+        total_tokens: .legacy_tokens,
+        cached_tokens: 0,
+        response: .legacy_response
+      }
+    else
+      empty
+    end
+  ' 2>/dev/null || true)"
+
+  if [ -n "$parsed_json" ]; then
+    CODEX_STATUS="$(jq -r '.status // empty' <<<"$parsed_json" 2>/dev/null || true)"
+    NUM_TURNS="$(jq -r '.turns // empty' <<<"$parsed_json" 2>/dev/null || true)"
+    TOTAL_TOKENS="$(jq -r '.total_tokens // empty' <<<"$parsed_json" 2>/dev/null || true)"
+    CACHED_TOKENS="$(jq -r '.cached_tokens // empty' <<<"$parsed_json" 2>/dev/null || true)"
+    CODEX_RESPONSE="$(jq -r '.response // empty' <<<"$parsed_json" 2>/dev/null || true)"
+  fi
+fi
+
+if [ $CODEX_RC -ne 0 ]; then
+  RESULT_LINE="RESULT=CODEX_FAILED (exit code $CODEX_RC)"
+  compute_changed_files
+  SCOPE_SUMMARY_LINES=("scope: not checked (codex-run failed)")
+  write_and_print_summary "$CODEX_RC"
+  exit "$CODEX_RC"
+fi
+
+# Step 7: Scope / forbidden check
+compute_changed_files
+
+# Match against scope pathspecs
+declare -A IN_SCOPE_PATHS=()
+if [ ${#SCOPE_LIST[@]} -gt 0 ]; then
+  while IFS= read -r -d '' entry; do
+    [ -z "$entry" ] && continue
+    xy="${entry:0:2}"
+    p="${entry:3}"
+    if [[ "${xy:0:1}" =~ [RC] || "${xy:1:1}" =~ [RC] ]]; then
+      read -r -d '' orig_p
+      IN_SCOPE_PATHS["$orig_p"]=1
+    fi
+    IN_SCOPE_PATHS["$p"]=1
+  done < <(git -C "$WORKTREE_DIR" status --porcelain=v1 -z -uall -- "${SCOPE_LIST[@]}")
+
+  while IFS= read -r -d '' p; do
+    [ -z "$p" ] && continue
+    IN_SCOPE_PATHS["$p"]=1
+  done < <(git -C "$WORKTREE_DIR" diff --name-only -z "$START_HEAD" -- "${SCOPE_LIST[@]}")
+fi
+
+is_forbidden() {
+  local p="$1"
+  local base
+  base="$(basename "$p")"
+  for allow in "${ALLOW_PATHS[@]}"; do
+    if [ "$p" = "$allow" ] || [ "$base" = "$allow" ]; then
+      return 1
+    fi
+  done
+  if [[ "$base" == .env* ]] || \
+     [[ "$base" == "pnpm-lock.yaml" ]] || \
+     [[ "$base" == "package-lock.json" ]] || \
+     [[ "$base" == "yarn.lock" ]] || \
+     [[ "$base" == CLAUDE*.md ]] || \
+     [[ "$base" == "AGENTS.md" ]] || \
+     [[ "$base" == GEMINI*.md ]] || \
+     [[ "$base" == CODEX*.md ]]; then
+    return 0
+  fi
+  return 1
+}
+
+SCOPE_VIOLATIONS=()
+NOW_HEAD="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
+if [ "$NOW_HEAD" != "$START_HEAD" ]; then
+  SCOPE_VIOLATIONS+=("scope: violation: codex moved HEAD (committed): $START_HEAD -> $NOW_HEAD")
+fi
+
+for p in "${CHANGED_PATHS[@]}"; do
+  forbidden=false
+  out_of_scope=false
+  if is_forbidden "$p"; then
+    forbidden=true
+  fi
+  if [ ${#SCOPE_LIST[@]} -gt 0 ]; then
+    if [ -z "${IN_SCOPE_PATHS[$p]+_}" ]; then
+      out_of_scope=true
+    fi
+  fi
+
+  if [ "$forbidden" = true ] && [ "$out_of_scope" = true ]; then
+    SCOPE_VIOLATIONS+=("scope: violation: $p (forbidden file, outside scope)")
+  elif [ "$forbidden" = true ]; then
+    SCOPE_VIOLATIONS+=("scope: violation: $p (forbidden file)")
+  elif [ "$out_of_scope" = true ]; then
+    SCOPE_VIOLATIONS+=("scope: violation: $p (outside scope)")
+  fi
+done
+
+HAS_SCOPE_VIOLATION=false
+if [ ${#SCOPE_VIOLATIONS[@]} -gt 0 ]; then
+  HAS_SCOPE_VIOLATION=true
+  SCOPE_SUMMARY_LINES=("${SCOPE_VIOLATIONS[@]}")
+else
+  if [ ${#SCOPE_LIST[@]} -eq 0 ]; then
+    SCOPE_SUMMARY_LINES=("scope: not checked (no --scope)")
+  else
+    SCOPE_SUMMARY_LINES=("scope: OK")
+  fi
+fi
+
+# Step 8: Summary & Exit code
+if [ "$HAS_SCOPE_VIOLATION" = true ]; then
+  RESULT_LINE="RESULT=SCOPE_VIOLATION"
+  EXIT_CODE=8
+else
+  RESULT_LINE="RESULT=OK"
+  EXIT_CODE=0
+fi
+
+write_and_print_summary "$EXIT_CODE"
+exit "$EXIT_CODE"

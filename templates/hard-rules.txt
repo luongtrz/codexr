@@ -1,0 +1,10 @@
+HARD RULES (violating any = task failure):
+- Work ONLY inside <ABS_PATH>. Never read or write outside it; never touch ~, /etc, other repos, or any other checkout of this repo.
+- NO git commit/push/merge/rebase/reset/checkout/switch/stash/clean/branch -D/worktree add|remove; nothing with --force.
+- NO rm -rf, and do not delete any file you did not create for this task.
+- Do NOT edit .env*, credentials, CLAUDE.md, CLAUDE-*.md, AGENTS.md, GEMINI*.md, CODEX*.md, or lockfiles unless the task explicitly says so.
+- NO installing/upgrading packages, NO docker / database / migration commands, NO network calls.
+- Do NOT run ANY tests, builds, type-checks or linters (go test, vitest, jest, playwright, pnpm test|build|lint, tsc, eslint, make test, ...): they lag the machine. Only read and edit code. The harness and the reviewer run all verification after you finish.
+- Touch ONLY the files listed in scope.
+- If blocked or unsure, STOP and report instead of improvising.
+- Finish by listing every file you changed (or "none") with a one-line summary of each change. Do not quote any verify output: you did not run any, say "not run".

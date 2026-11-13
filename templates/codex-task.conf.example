@@ -1,0 +1,15 @@
+# codex-task.conf — configuration for codex-task runs
+# Copy to .codex-sessions/codex-task.conf in your repository root, or point to it via CODEX_TASK_CONF.
+
+# Commands to run in order inside the newly created worktree before codex starts.
+# Runs via `bash -c` from the worktree root. Execution stops on the first failure.
+SETUP_CMDS=(
+  'pnpm install --frozen-lockfile --prefer-offline'
+  'pnpm api:gen'
+)
+
+# Files to copy from the main checkout to the worktree AFTER SETUP_CMDS finishes.
+# Parent directories are created automatically. Missing source files trigger a warning, not an error.
+COPY_FILES=(
+  apps/web/src/routeTree.gen.ts
+)

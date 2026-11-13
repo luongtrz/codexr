@@ -1,0 +1,1573 @@
+#!/usr/bin/env bash
+# codexr — save / switch / rotate multiple accounts for the OpenAI codex CLI.
+#
+# It only copies auth files around; it never prints token contents.
+# Environment variables:
+#   CODEX_HOME    codex home directory (default ~/.codex)
+#   CODEXR_BIN    codex binary (default codex)
+#   CODEXR_TZ     timezone for displayed times (default UTC-7, which is UTC+7 in POSIX notation)
+#   CODEXR_NOW    fake epoch for "now" (tests only; default date +%s)
+#   CODEXR_COLOR  auto (default) | always | never — colours in the list table
+set -euo pipefail
+umask 077
+
+# All displayed times are UTC+7. POSIX quirk: 'UTC-7' means UTC+7.
+export TZ="${CODEXR_TZ:-UTC-7}"
+export LC_TIME=C # so %p is always AM/PM, regardless of the machine's language
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOME="$(readlink -f "$CODEX_HOME" 2>/dev/null || echo "$CODEX_HOME")"
+CODEXR_BIN="${CODEXR_BIN:-codex}"
+AUTH="$CODEX_HOME/auth.json"
+ACCTS="$CODEX_HOME/accounts"
+STATE="$ACCTS/state.json"
+DEFAULT_COOLDOWN=18000 # 5h, used when "Resets in" cannot be parsed
+
+die() { echo "codexr: $*" >&2; exit "${2:-1}"; }
+now() { echo "${CODEXR_NOW:-$(date +%s)}"; }
+
+need_jq() { command -v jq >/dev/null || die "jq is required"; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "account name may only contain letters, digits, '-' and '_': '$1'"; }
+
+# --- where the login lives -------------------------------------------------------------------------------------------
+# Live login is $CODEX_HOME/auth.json on all platforms (one file backend everywhere).
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ON_WINDOWS=1 ;; *) ON_WINDOWS=0 ;; esac
+if [ "$ON_WINDOWS" = 1 ]; then PLATFORM=windows; else PLATFORM=linux; fi
+. "$SELF_DIR/../platforms/$PLATFORM/platform.sh"
+. "$SELF_DIR/../lib/defaults.sh"
+platform_init
+
+init_state() {
+  mkdir -p "$ACCTS"
+  chmod 700 "$ACCTS"
+  [ -f "$STATE" ] || echo '{"active":"","cooldown":{}}' >"$STATE"
+}
+
+# atomic state write: $1 = jq expression, remaining args are passed to jq
+state_update() {
+  local expr="$1"; shift
+  local tmp own=0
+  # read-modify-write of state.json: take the lock (unless this process already holds it), or two codexr running at the same
+  # time (parallel codex-run switching accounts) overwrite each other's change
+  if [ "$LOCK_HELD" = 0 ]; then lock_acquire; own=1; fi
+  tmp="$(mktemp "$ACCTS/.state.XXXXXX")"
+  if jq "$@" "$expr" "$STATE" >"$tmp"; then chmod 600 "$tmp"; mv "$tmp" "$STATE"; else rm -f "$tmp"; die "failed to write state"; fi
+  if [ "$own" = 1 ]; then lock_release; fi
+}
+
+# --- the login in use ("live") ---------------------------------------------------------------------------------------
+# LIVE = path of a readable copy of the login codex is using now, empty if there is none. Set by live_load, which must run
+# in the main shell (not in $(...)), and again after anything that changes the login.
+LIVE="" LIVE_SNAP="" LOCK_HELD=0
+LOCKDIR="$ACCTS/.swap.lock"
+
+live_load() {
+  LIVE=""
+  if [ -f "$AUTH" ]; then LIVE="$AUTH"; fi
+  return 0
+}
+
+# install file $1 as the login in use
+live_put() {
+  atomic_cp "$1" "$AUTH" || die "cannot write the login ($AUTH)"
+  LIVE="$AUTH"
+}
+
+# remove the login in use
+live_clear() {
+  rm -f "$AUTH"
+  LIVE=""
+}
+
+# One codexr at a time may change the login in use, the slots or state.json.
+# The lock is a file created exclusively (bash noclobber = open with O_EXCL) holding the owner's pid.
+lock_acquire() {
+  [ "$LOCK_HELD" = 0 ] || return 0
+  mkdir -p "$ACCTS"
+  local waited=0 owner
+  # a lock left by an older codexr was a directory holding a pid file
+  if [ -d "$LOCKDIR" ]; then
+    owner="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$LOCKDIR"; fi
+  fi
+  until ( set -o noclobber; echo "$$" >"$LOCKDIR" ) 2>/dev/null; do
+    owner="$(cat "$LOCKDIR" 2>/dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      # looks abandoned (its owner is gone). But that owner may simply have released it and exited, and somebody else taken
+      # the lock since: remove it only if it still names that same dead owner (else two codexr would both hold the lock)
+      if [ "$(cat "$LOCKDIR" 2>/dev/null || true)" = "$owner" ]; then rm -f "$LOCKDIR"; fi
+      continue
+    fi
+    waited=$((waited + 1))
+    [ "$waited" -le $((${CODEXR_LOCK_WAIT:-120} * 20)) ] || die "another codexr is switching accounts (lock: $LOCKDIR); try again in a moment"
+    sleep 0.05
+  done
+  LOCK_HELD=1
+}
+
+lock_release() {
+  # only remove the lock if it is still ours
+  if [ "$LOCK_HELD" = 1 ]; then
+    if [ "$(cat "$LOCKDIR" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "$LOCKDIR" 2>/dev/null || { sleep 0.02; rm -f "$LOCKDIR" 2>/dev/null || true; }
+    fi
+    LOCK_HELD=0
+  fi
+  return 0
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  [ -z "$LIVE_SNAP" ] || rm -f "$LIVE_SNAP"
+  rm -f "$ACCTS"/.snap.$$.* 2>/dev/null || true
+  lock_release
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+validate_login() {
+  local file="$1"
+  [ -f "$file" ] || die "login file not found: $file"
+  # one jq call, fields joined with a non-blank separator so an empty auth_mode cannot shift id_token into it
+  # (the mode is echoed in an error message; token contents must never be)
+  local out mode id_tok
+  if ! out="$(jq -r '[(.auth_mode // ""), (if (.tokens.id_token // "") == "" then "" else "present" end)] | join("|")' "$file" 2>/dev/null)"; then
+    die "login is not valid JSON ($file)"
+  fi
+  mode="${out%%|*}" id_tok="${out#*|}"
+  if [ "$mode" = "api_key" ] || [ "$mode" = "apikey" ]; then
+    die "API-key logins are not supported; codexr requires a ChatGPT login (auth_mode: chatgpt)"
+  fi
+  if [ "$mode" != "chatgpt" ]; then
+    die "invalid login: auth_mode must be 'chatgpt' (got '${mode:-empty}')"
+  fi
+  if [ -z "$id_tok" ]; then
+    die "invalid login: tokens.id_token is missing or empty"
+  fi
+}
+
+# Internal identity of an auth file, for comparison only — NEVER printed.
+# Decoded from tokens.id_token (JWT payload sub claim, fallback tokens.account_id).
+ident_of() {
+  [ -s "$1" ] || return 0
+  local id_tok="" acct_id=""
+  # non-blank separator: with a tab, an empty id_token would shift account_id into id_tok
+  local both
+  both="$(jq -r '[(.tokens.id_token // ""), (.tokens.account_id // "")] | join("|")' "$1" 2>/dev/null)" || both=""
+  id_tok="${both%%|*}" acct_id="${both#*|}"
+  local sub=""
+  if [[ "$id_tok" == *.*.* ]]; then
+    local rem="${id_tok#*.}"
+    local payload="${rem%%.*}"
+    local b64="${payload//-/\+}"
+    b64="${b64//_//}"
+    case "$(( ${#b64} % 4 ))" in
+      2) b64="${b64}==" ;;
+      3) b64="${b64}=" ;;
+    esac
+    sub="$(printf '%s' "$b64" | base64 -d 2>/dev/null | jq -r '.sub // empty' 2>/dev/null)" || sub=""
+  fi
+  if [ -z "$sub" ]; then
+    sub="$acct_id"
+  fi
+  if [ -n "$sub" ]; then
+    printf 'sub:%s' "$sub"
+  fi
+}
+
+# The slot whose login is the one in FILE (matched by identity); empty when it matches no slot.
+owner_of() {
+  [ -s "$1" ] || return 0
+  local id n
+  id="$(ident_of "$1")"
+  [ -n "$id" ] || return 0
+  while read -r n; do
+    if [ "$(ident_of "$ACCTS/$n.json")" = "$id" ]; then echo "$n"; return 0; fi
+  done < <(slots)
+  return 0
+}
+
+real_owner() {
+  [ -n "$LIVE" ] || return 0
+  owner_of "$LIVE"
+}
+
+# Write DEST by renaming a private temp file from the same directory: nobody
+# ever reads a half-written login.
+atomic_cp() {
+  local tmp
+  tmp="$(mktemp "$2.XXXXXX")" || return 1
+  if cp "$1" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$2"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+
+# A private copy of the login in use; prints its path (nothing when nobody is logged in). Decisions and write-backs are made
+# from this one copy, so they always agree even if the live file changes in the meantime (it is shared with codex and with
+# every other codexr / codex-run). Removed by the caller, or at exit.
+live_snapshot() {
+  [ -n "$LIVE" ] || return 0
+  local f
+  f="$(mktemp "$ACCTS/.snap.$$.XXXXXX")" || return 1
+  if cp "$LIVE" "$f" && chmod 600 "$f"; then echo "$f"; else rm -f "$f"; return 1; fi
+}
+
+# The account actually in use = the slot matching the real auth file. Only when no slot matches do we fall back to the name
+# stored in state (state can be stale when you log in with codex by hand without saving).
+active_name() {
+  local o
+  o="$(real_owner)"
+  if [ -n "$o" ]; then echo "$o"; else jq -r '.active // ""' "$STATE"; fi
+}
+
+# "4h13m27s" / "43m29s" / "1d2h" / "90" (seconds) -> seconds. Also accepts a sentence containing "Resets in X".
+parse_duration() {
+  local s="$1"
+  if [[ "$s" =~ Resets\ in\ ([0-9dhms]+) ]]; then s="${BASH_REMATCH[1]}"; fi
+  if [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"; return 0; fi
+  [[ "$s" =~ ^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$ && -n "$s" ]] || return 1
+  local total=0 d=${BASH_REMATCH[1]:-} h=${BASH_REMATCH[2]:-} m=${BASH_REMATCH[3]:-} sec=${BASH_REMATCH[4]:-}
+  [ -n "$d" ] && total=$((total + ${d%d} * 86400))
+  [ -n "$h" ] && total=$((total + ${h%h} * 3600))
+  [ -n "$m" ] && total=$((total + ${m%m} * 60))
+  [ -n "$sec" ] && total=$((total + ${sec%s}))
+  echo "$total"
+}
+
+# epoch -> "dd/mm/yyyy hh:mm AM|PM" (in CODEXR_TZ)
+fmt_time() { date -d "@$1" '+%d/%m/%Y %I:%M %p'; }
+
+fmt_dur() { # seconds -> "4h13m"
+  local s=$1
+  if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"; fi
+}
+
+slots() { # sorted slot names
+  local f
+  for f in "$ACCTS"/*.json; do
+    [ -e "$f" ] || continue
+    local b
+    b="$(basename "$f" .json)"
+    [ "$b" != "state" ] || continue
+    echo "$b"
+  done | sort
+}
+
+cooldown_until() { jq -r --arg n "$1" '.cooldown[$n] // 0' "$STATE"; }
+
+cmd_save() {
+  [ $# -eq 1 ] || die "usage: codexr save <name>"
+  valid_name "$1"; need_jq
+  init_state
+  lock_acquire
+  live_load # again: the login may have changed while waiting for the lock
+  [ -n "$LIVE" ] || die "no login yet ($AUTH). Log in with 'codexr' first"
+  validate_login "$LIVE"
+  atomic_cp "$LIVE" "$ACCTS/$1.json" || die "cannot write slot '$1'"
+  state_update '.active=$n | del(.cooldown[$n])' --arg n "$1"
+  lock_release
+  echo "saved account '$1' (now active)"
+}
+
+cmd_use() {
+  [ $# -eq 1 ] || die "usage: codexr use <name>"
+  valid_name "$1"; need_jq; init_state
+  [ -f "$ACCTS/$1.json" ] || die "no slot '$1' (see: codexr list)"
+  validate_login "$ACCTS/$1.json"
+  lock_acquire
+  live_load # again: the login may have changed while waiting for the lock
+  local snap cur=""
+  snap="$(live_snapshot)"
+  if [ -n "$snap" ]; then
+    # Which slot the login in use belongs to is decided from the SAME copy that is written back: it can only ever go to the
+    # slot with the same account (a write-back that re-read the live file once lost to another switch and put one account's
+    # login into another's slot)
+    cur="$(owner_of "$snap")"
+    # backup first, before anything is overwritten
+    atomic_cp "$snap" "$ACCTS/.last-token.bak"
+    # keep the access token codex refreshed, but only write it back to the slot it belongs to; if it matches no slot,
+    # no slot is overwritten (the unsaved token is still in .last-token.bak)
+    if [ -n "$cur" ] && [ "$cur" != "$1" ]; then atomic_cp "$snap" "$ACCTS/$cur.json"; fi
+    rm -f "$snap"
+  fi
+  live_put "$ACCTS/$1.json"
+  lock_release
+  state_update '.active=$n' --arg n "$1"
+  echo "switched to account '$1'"
+}
+
+cmd_cooldown() {
+  [ $# -ge 1 ] || die "usage: codexr cooldown <name> [duration]"
+  local name="$1"; shift
+  valid_name "$name"; need_jq; init_state
+  [ -f "$ACCTS/$name.json" ] || die "no slot '$name' (see: codexr list)"
+  validate_login "$ACCTS/$name.json"
+
+  local until=0 secs=0
+  if [ $# -ge 1 ]; then
+    if ! secs="$(parse_duration "$*")"; then
+      echo "codexr: cannot parse duration '$*', using default 5h" >&2
+      secs=$DEFAULT_COOLDOWN
+    fi
+    until=$(($(now) + secs))
+  else
+    local out_file raw="" probe_ok=0
+    out_file="$(mktemp "$ACCTS/.probe.out.XXXXXX")"
+    # in a subshell: measure_one sets its own EXIT/INT/TERM traps to remove its temp dir and must not replace ours
+    if (measure_one "$name" "$out_file" "") >/dev/null 2>&1; then
+      probe_ok=1
+      raw="$(cat "$out_file" 2>/dev/null || true)"
+    fi
+    rm -f "$out_file"
+
+    # quota_ingest stores the snapshot and, for an exhausted account, the cooldown; keep the time it computed
+    if [ "$probe_ok" = 1 ] && [ -n "$raw" ] && quota_ingest "$name" "$raw"; then
+      until="$(cooldown_until "$name")"
+    fi
+    # probe failed, or the account looks usable (the caller knows better, e.g. codex-run saw a usage-limit error): default
+    if [ "$until" -le "$(now)" ]; then
+      secs=$DEFAULT_COOLDOWN
+      until=$(($(now) + secs))
+    else
+      secs=$((until - $(now)))
+    fi
+  fi
+
+  state_update '.cooldown[$n]=$u' --arg n "$name" --argjson u "$until"
+  echo "account '$name' cooldown $(fmt_dur "$secs") (reset $(fmt_time "$until"))"
+}
+
+# rename <old> <new>: rename a slot. The login, the cooldown and the saved quota data move with it; nothing else changes
+# (the real auth file is not touched, no codex is started).
+cmd_rename() {
+  [ $# -eq 2 ] || die "usage: codexr rename <old> <new>"
+  local old="$1" new="$2"
+  valid_name "$old"; valid_name "$new"; need_jq; init_state
+  lock_acquire # a concurrent use must not write a slot under the old name while it is being renamed
+  [ "$old" != "$new" ] || die "old and new names are the same: '$old'"
+  [ -f "$ACCTS/$old.json" ] || die "no slot '$old' (see: codexr list)"
+  [ ! -e "$ACCTS/$new.json" ] || die "slot '$new' already exists; nothing was changed (remove it first if you really want to replace it)"
+  mv "$ACCTS/$old.json" "$ACCTS/$new.json"
+  state_update '(if .active == $o then .active = $n else . end)
+    | (if ((.cooldown // {}) | has($o)) then .cooldown[$n] = .cooldown[$o] | del(.cooldown[$o]) else . end)
+    | (if ((.quota // {}) | has($o)) then .quota[$n] = .quota[$o] | del(.quota[$o]) else . end)
+    | (if .ui_order then .ui_order |= map(if . == $o then $n else . end) else . end)' --arg o "$old" --arg n "$new"
+  lock_release
+  echo "renamed slot '$old' to '$new'"
+}
+
+cmd_del() {
+  [ $# -eq 1 ] || die "usage: codexr del <name>"
+  local name="$1"
+  valid_name "$name"; need_jq; init_state
+  lock_acquire
+  live_load
+  [ -f "$ACCTS/$name.json" ] || die "no slot '$name' (see: codexr list)"
+  local is_live=0
+  if [ -n "$LIVE" ] && [ "$(ident_of "$LIVE")" = "$(ident_of "$ACCTS/$name.json")" ]; then
+    is_live=1
+  fi
+  if [ -f "$ACCTS/.last-token.bak" ] && [ "$(ident_of "$ACCTS/.last-token.bak")" = "$(ident_of "$ACCTS/$name.json")" ]; then
+    rm -f "$ACCTS/.last-token.bak"
+  fi
+  rm -f "$ACCTS/$name.json"
+  if [ "$is_live" = 1 ]; then
+    live_clear
+  fi
+  state_update '(if .active == $n then .active = "" else . end) | del(.cooldown[$n]) | del(.quota[$n]) | (if .ui_order then .ui_order |= map(select(. != $n)) else . end)' --arg n "$name"
+  lock_release
+  if [ "$is_live" = 1 ]; then
+    echo "deleted account '$name' (and cleared active login)"
+  else
+    echo "deleted account '$name'"
+  fi
+}
+
+cmd_clear() {
+  [ $# -eq 1 ] || die "usage: codexr clear <name>"
+  valid_name "$1"; need_jq; init_state
+  state_update 'del(.cooldown[$n])' --arg n "$1"
+  echo "cleared cooldown of '$1'"
+}
+
+cmd_swapui() {
+  need_jq; init_state
+  if [ $# -eq 1 ] && { [ "$1" = "--reset" ] || [ "$1" = "reset" ]; }; then
+    lock_acquire
+    state_update 'del(.ui_order)'
+    lock_release
+    echo "reset UI display order to default (weekly limit reset order)"
+    return 0
+  fi
+  [ $# -eq 2 ] || die "usage: codexr swapui <name1> <name2> (or: codexr swapui --reset)"
+  local a="$1" b="$2"
+  valid_name "$a"; valid_name "$b"
+  [ -f "$ACCTS/$a.json" ] || die "no slot '$a' (see: codexr list)"
+  [ -f "$ACCTS/$b.json" ] || die "no slot '$b' (see: codexr list)"
+  [ "$a" != "$b" ] || die "cannot swap an account with itself: '$a'"
+  lock_acquire
+  local -a def_arr=()
+  mapfile -t def_arr < <(rows_by_week_reset " ")
+  local def_json="[]"
+  if [ "${#def_arr[@]}" -gt 0 ]; then
+    def_json="$(printf '%s\n' "${def_arr[@]}" | jq -R . | jq -s .)"
+  fi
+  state_update '
+    (if (.ui_order // []) | length == 0 then $def else .ui_order end) as $base
+    | ($base + [$def[] | select(. as $x | ($base | index($x)) == null)]) as $arr
+    | ($arr | index($a)) as $ia
+    | ($arr | index($b)) as $ib
+    | if $ia != null and $ib != null then
+        .ui_order = ($arr | .[$ia] = $b | .[$ib] = $a)
+      else
+        .
+      end
+  ' --arg a "$a" --arg b "$b" --argjson def "$def_json"
+  lock_release
+  echo "swapped UI positions of '$a' and '$b' in 'codexr list'"
+}
+
+# Print the account to switch to: among the READY accounts (no cooldown) the one whose weekly limit resets soonest, from the last
+# measurement (the same order 'codexr list' shows); accounts never measured come last, ties by name. The account in use is only
+# returned when nothing else is ready. If none is ready: exit 3 and report the earliest end of a cooldown.
+# -v / --why also prints, on stderr, which account was chosen and why.
+cmd_next() {
+  local why=0
+  case "${1:-}" in -v|--why) why=1 ;; esac
+  need_jq; init_state
+  local cur t n until gwr earliest=0 earliest_n="" fallback="" total=0 nother=0 pick=""
+  cur="$(active_name)"; t="$(now)"
+  while read -r n; do
+    total=$((total + 1))
+    until="$(cooldown_until "$n")"
+    if [ "$until" -gt "$t" ]; then
+      if [ "$earliest" -eq 0 ] || [ "$until" -lt "$earliest" ]; then earliest=$until; earliest_n=$n; fi
+    else
+      if [ "$n" = "$cur" ]; then fallback="$n"
+      else nother=$((nother + 1)); if [ -z "$pick" ]; then pick="$n"; fi; fi
+    fi
+  done < <(rows_by_week_reset " ")
+  [ "$total" -gt 0 ] || die "no accounts yet" 2
+  if [ -z "$pick" ] && [ -n "$fallback" ]; then pick="$fallback"; fi
+  if [ -n "$pick" ]; then
+    if [ "$why" = 1 ]; then
+      gwr="$(jq -r --arg n "$pick" '.quota[$n].gwr // empty' "$STATE")"
+      if [ "$nother" -eq 0 ]; then echo "codexr: next account '$pick': no other account is ready, so the one in use stays" >&2
+      elif [ -n "$gwr" ]; then echo "codexr: next account '$pick': weekly limit resets $(fmt_time "$gwr"), the soonest of the $nother other ready account(s)" >&2
+      else echo "codexr: next account '$pick': no quota data yet (run 'codexr list'); first of the $nother other ready account(s) by name" >&2; fi
+    fi
+    echo "$pick"
+    return 0
+  fi
+  echo "codexr: all $total accounts are on cooldown; earliest: '$earliest_n' resets at $(fmt_time "$earliest") ($(fmt_dur $((earliest - t))) left)" >&2
+  return 3
+}
+
+cmd_rotate() {
+  need_jq; init_state
+  local cur
+  cur="$(active_name)"
+  [ -n "$cur" ] || die "no active account (see: codexr list)"
+  [ -f "$ACCTS/$cur.json" ] || die "no slot '$cur' (see: codexr list)"
+  validate_login "$ACCTS/$cur.json"
+
+  local t="$(now)" total=0 ready_others=0 earliest=0 earliest_n=""
+  local n until
+  while read -r n; do
+    total=$((total + 1))
+    until="$(cooldown_until "$n")"
+    if [ "$until" -gt "$t" ]; then
+      if [ "$earliest" -eq 0 ] || [ "$until" -lt "$earliest" ]; then
+        earliest=$until
+        earliest_n=$n
+      fi
+    elif [ "$n" != "$cur" ]; then
+      ready_others=$((ready_others + 1))
+    fi
+  done < <(slots)
+
+  [ "$total" -gt 0 ] || die "no accounts yet" 2
+
+  if [ "$ready_others" -eq 0 ]; then
+    if [ "$earliest" -eq 0 ]; then
+      earliest=$((t + DEFAULT_COOLDOWN))
+      earliest_n="$cur"
+    fi
+    echo "codexr: all $total accounts are on cooldown; earliest: '$earliest_n' resets at $(fmt_time "$earliest") ($(fmt_dur $((earliest - t))) left)" >&2
+    return 3
+  fi
+
+  cmd_cooldown "$cur" "$@"
+
+  local nxt
+  if ! nxt="$(cmd_next -v)"; then return 3; fi
+  cmd_use "$nxt"
+  echo "reopen with: codexr -c"
+}
+
+# When does an exhausted account become usable again? Prints the epoch: the weekly reset when the weekly window is the
+# exhausted one (it is the later one when both are), else the 5-hour reset; DEFAULT_COOLDOWN from now when no reset is in the
+# future. Args: left% of the 5h window, its reset, left% of the weekly window, its reset, rateLimitReachedType, now.
+exhausted_until() {
+  local p5="$1" r5="$2" pw="$3" rw="$4" rlrt="$5" t="$6" u=0
+  if [ "$pw" -le 0 ]; then u="$rw"
+  elif [ "$p5" -le 0 ]; then u="$r5"
+  elif [[ "$rlrt" =~ week ]]; then u="$rw"
+  elif [ "$r5" -gt "$t" ]; then u="$r5"
+  elif [ "$rw" -gt "$t" ]; then u="$rw"
+  fi
+  if [ "$u" -le "$t" ]; then u=$((t + DEFAULT_COOLDOWN)); fi
+  echo "$u"
+}
+
+quota_fetch() {
+  local home="$1"
+  local home_arg="$home"
+  if declare -F platform_arg_path >/dev/null; then home_arg="$(platform_arg_path "$home")"; fi
+
+  local in_pipe="$home/.in.pipe"
+  local out_pipe="$home/.out.pipe"
+  mkfifo "$in_pipe" "$out_pipe" 2>/dev/null || return 1
+
+  local -a cap=()
+  if command -v timeout >/dev/null; then cap=(timeout "${CODEXR_PROBE_TIMEOUT:-30}"); fi
+
+  env CODEX_HOME="$home_arg" "${PLATFORM_DETACH_WAIT[@]}" "${cap[@]}" \
+    "$CODEXR_BIN" -c cli_auth_credentials_store="file" app-server < "$in_pipe" > "$out_pipe" 2>/dev/null &
+  local srv_pid=$!
+
+  (
+    printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"codexr","title":"codexr","version":"0"}}}' \
+      '{"jsonrpc":"2.0","method":"initialized"}' \
+      '{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}'
+    sleep "${CODEXR_PROBE_TIMEOUT:-30}"
+  ) > "$in_pipe" 2>/dev/null &
+  local feeder_pid=$!
+
+  local found="" line
+  while IFS= read -t "${CODEXR_PROBE_TIMEOUT:-30}" -r line; do
+    if [[ "$line" =~ \"id\":[[:space:]]*2[,\}] ]]; then
+      found="$line"
+      break
+    fi
+  done < "$out_pipe"
+
+  kill "$feeder_pid" 2>/dev/null || true
+  if declare -F platform_kill_tree >/dev/null && platform_kill_tree "$srv_pid"; then
+    :
+  else
+    pkill -TERM -P "$srv_pid" 2>/dev/null || true
+    kill -TERM -- "-$srv_pid" 2>/dev/null || kill -TERM "$srv_pid" 2>/dev/null || true
+    kill -KILL -- "-$srv_pid" 2>/dev/null || kill -KILL "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+  fi
+  wait "$feeder_pid" 2>/dev/null || true
+  rm -f "$in_pipe" "$out_pipe" 2>/dev/null || true
+
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
+}
+
+measure_one() {
+  local name="$1" out="$2" act="${3:-}" home src rc=0
+  home="$(mktemp -d "$ACCTS/.probe.XXXXXX")"
+  chmod 700 "$home"
+  trap 'rm -rf "$home"' EXIT INT TERM
+
+  if [ "$name" = "$act" ] && [ -n "${LIVE_SNAP:-}" ]; then
+    src="$LIVE_SNAP"
+  else
+    src="$ACCTS/$name.json"
+  fi
+
+  if [ ! -f "$src" ]; then
+    rm -rf "$home"
+    trap - EXIT INT TERM
+    return 1
+  fi
+
+  cp "$src" "$home/auth.json"
+  chmod 600 "$home/auth.json"
+
+  "$PROBE_FN" "$home" "$home" "$name" >"$out" 2>/dev/null || rc=$?
+
+  # codex refreshed the login during the probe: keep the new tokens. Refresh tokens are single-use, so the new login goes to the
+  # slot of the same identity AND, when the login in use is still exactly the copy that was probed (nobody refreshed or
+  # switched it meanwhile), to the login in use; otherwise that file would keep a used-up refresh token.
+  if [ -s "$home/auth.json" ] && ! cmp -s "$home/auth.json" "$src" 2>/dev/null; then
+    local newid
+    newid="$(ident_of "$home/auth.json")"
+    lock_acquire
+    if [ -n "$newid" ]; then
+      if [ -f "$ACCTS/$name.json" ] && [ "$(ident_of "$ACCTS/$name.json")" = "$newid" ]; then
+        atomic_cp "$home/auth.json" "$ACCTS/$name.json"
+      fi
+      if [ -f "$AUTH" ] && cmp -s "$AUTH" "$src" && [ "$(ident_of "$AUTH")" = "$newid" ]; then
+        atomic_cp "$home/auth.json" "$AUTH"
+      fi
+    fi
+    lock_release
+  fi
+
+  rm -rf "$home"
+  trap - EXIT INT TERM
+  return "$rc"
+}
+
+quota_ingest() {
+  local name="$1" raw="$2"
+  [ -n "$raw" ] || return 1
+
+  local parsed
+  parsed="$(jq -r '
+    .result as $r |
+    if ($r.rateLimits? | type == "object") then
+      ($r.rateLimits.primary // {}) as $p |
+      ($r.rateLimits.secondary // {}) as $s |
+      (100 - ($p.usedPercent // 0) | round | if . < 0 then 0 elif . > 100 then 100 else . end) as $p5 |
+      (100 - ($s.usedPercent // 0) | round | if . < 0 then 0 elif . > 100 then 100 else . end) as $pw |
+      ($p.resetsAt // 0) as $r5 |
+      ($s.resetsAt // 0) as $rw |
+      ($r.rateLimits.planType // "") as $plan |
+      ($r.rateLimits.rateLimitReachedType // null) as $rlrt |
+      ($r.ordinaryUsageAllowed // true) as $oua |
+      ($oua == false or $rlrt != null or $p5 <= 0 or $pw <= 0) as $ex |
+      [$plan, $p5, $r5, $pw, $rw, $ex, ($rlrt // "")] | @tsv
+    else
+      empty
+    end
+  ' <<<"$raw" 2>/dev/null)" || parsed=""
+
+  [ -n "$parsed" ] || return 1
+
+  local plan p5 r5 pw rw ex rlrt
+  IFS=$'\t' read -r plan p5 r5 pw rw ex rlrt <<<"$parsed"
+
+  [[ "$p5" =~ ^[0-9]+$ && "$pw" =~ ^[0-9]+$ ]] || return 1
+
+  local t
+  t="$(now)"
+
+  state_update '.quota[$n]={at:$t,measured_at:$t,plan:$plan,p5:$p5,r5:$r5,pw:$pw,rw:$rw,gwr:$rw,exhausted:$ex}' \
+    --arg n "$name" --argjson t "$t" \
+    --arg plan "$plan" --argjson p5 "$p5" --argjson r5 "$r5" \
+    --argjson pw "$pw" --argjson rw "$rw" --argjson ex "$ex"
+
+  if [ "$ex" = "true" ]; then
+    state_update '.cooldown[$n]=$u' --arg n "$name" --argjson u "$(exhausted_until "$p5" "$r5" "$pw" "$rw" "$rlrt" "$t")"
+  else
+    state_update 'del(.cooldown[$n])' --arg n "$name"
+  fi
+
+  return 0
+}
+
+# Measure all slots ($@) and store snapshots; MEASURE_FAILED = names of the accounts that failed (space-separated).
+MEASURE_FAILED=""
+# what measure_all runs per account: PROBE_FN prints raw output, INGEST_FN stores it
+PROBE_FN=quota_fetch INGEST_FN=quota_ingest TEST_DIR=""
+declare -A TEST_TRY=() TEST_SKIP=()
+measure_all() {
+  measure_all_parallel "$@"
+}
+
+measure_all_parallel() {
+  local -a names=("$@") pids=() failed=()
+  local d act i n
+  d="$(mktemp -d "$ACCTS/.probe.XXXXXX")"
+  chmod 700 "$d"
+  lock_acquire; live_load
+  LIVE_SNAP="$(live_snapshot)"; act=""
+  if [ -n "$LIVE_SNAP" ]; then act="$(owner_of "$LIVE_SNAP")"; fi
+  lock_release
+  for n in "${names[@]}"; do
+    measure_one "$n" "$d/$n.out" "$act" &
+    pids+=($!)
+  done
+  for i in "${!names[@]}"; do
+    n="${names[$i]}"
+    if wait "${pids[$i]}" && [ -s "$d/$n.out" ] && "$INGEST_FN" "$n" "$(cat "$d/$n.out")"; then :; else failed+=("$n"); fi
+  done
+  rm -rf "$d"
+  if [ -n "$LIVE_SNAP" ]; then rm -f "$LIVE_SNAP"; LIVE_SNAP=""; fi
+  MEASURE_FAILED="${failed[*]:-}"
+}
+
+# Slot names ordered by when the weekly limit resets (from the last measurement), soonest first. Accounts without usable data
+# (never measured, or just failed to measure) come last; ties are broken by name. $1 = " names that failed " (padded with spaces).
+rows_by_week_reset() {
+  local failed="$1" n gwr
+  while read -r n; do
+    gwr="$(jq -r --arg n "$n" '.quota[$n].rw // .quota[$n].gwr // empty' "$STATE")"
+    if [[ "$failed" == *" $n "* ]] || [ -z "$gwr" ]; then gwr=99999999999; fi
+    printf '%s %s\n' "$gwr" "$n"
+  done < <(slots) | sort -k1,1n -k2,2 | cut -d' ' -f2
+}
+
+# Display order for 'codexr list': user-customized order from .ui_order in state.json,
+# followed by any new/unpositioned slots in weekly-reset order.
+rows_for_list() {
+  local failed="$1"
+  local -a ui_order=()
+  mapfile -t ui_order < <(jq -r '(.ui_order // [])[]' "$STATE" 2>/dev/null)
+  if [ "${#ui_order[@]}" -eq 0 ]; then
+    rows_by_week_reset "$failed"
+    return 0
+  fi
+  local -A seen=()
+  local n
+  for n in "${ui_order[@]}"; do
+    if [ -f "$ACCTS/$n.json" ] && [ -z "${seen[$n]:-}" ]; then
+      seen["$n"]=1
+      echo "$n"
+    fi
+  done
+  while read -r n; do
+    [ -n "$n" ] || continue
+    if [ -z "${seen[$n]:-}" ]; then
+      echo "$n"
+    fi
+  done < <(rows_by_week_reset "$failed")
+}
+
+table_dash() { local s; printf -v s "%*s" "$1" ""; echo -n "${s// /─}"; }
+
+term_width() {
+  if [ -n "${CODEXR_WIDE:-}" ]; then echo 0; return; fi
+  if [ -n "${CODEXR_RESPONSIVE:-}" ] || [ "${1:-}" = "1" ] || [ -t 1 ]; then
+    local w="${CODEXR_COLUMNS:-${COLUMNS:-}}"
+    if [ -z "$w" ] || [ "$w" -le 0 ] 2>/dev/null; then
+      w="$(tput cols 2>/dev/null || echo 0)"
+    fi
+    if [ -z "$w" ] || [ "$w" -le 0 ] 2>/dev/null; then
+      w="$(stty size 2>/dev/null | awk '{print $2}')"
+    fi
+    if [ -z "$w" ] || [ "$w" -le 0 ] 2>/dev/null; then
+      w="$(stty size < /dev/tty 2>/dev/null | awk '{print $2}')"
+    fi
+    echo "${w:-0}"
+  else
+    echo 0
+  fi
+}
+
+print_table() {
+  local failed=" $1 " live="$2" t cur n snap p5 r5 pw rw at plan until st sc oldest=0 mark
+  t="$(now)"; cur="$(active_name)"
+
+  local G="" Y="" R="" Z="" usecolor=0
+  case "${CODEXR_COLOR:-auto}" in
+    always) usecolor=1 ;;
+    never) usecolor=0 ;;
+    *) if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then usecolor=1; fi ;;
+  esac
+  local BG_ALT="" ALL_RST=""
+  if [ "$usecolor" = 1 ]; then
+    G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; Z=$'\033[39m'
+    ALL_RST=$'\033[0m'
+    case "${COLORFGBG:-}" in
+      *";15"|"0;"*) BG_ALT=$'\033[48;5;254m' ;;
+      *) BG_ALT=$'\033[48;5;236m' ;;
+    esac
+  fi
+
+  pct() {
+    local c="$G"
+    if [ "$1" -le 10 ]; then c="$R"; elif [ "$1" -le 40 ]; then c="$Y"; fi
+    printf '%s%3s%%%s' "$c" "$1" "$Z"
+  }
+
+  cell() {
+    if [ -z "$1" ] || [ "$2" -le "$t" ]; then
+      printf '%4s  %-19s' '-' ''
+    else
+      printf '%s  %-19s' "$(pct "$1")" "$(fmt_time "$2")"
+    fi
+  }
+
+  local is_tty=0; [ -t 1 ] && is_tty=1
+  local tw; tw="$(term_width "$is_tty")"
+  local show_plan=1 plan_hidden=0
+  local status_dash=45 status_pad=43
+  local def_s=45 min_s=16
+
+  if [ "$tw" -gt 0 ]; then
+    local needed_with=$((90 + def_s))
+    local min_with=$((90 + min_s))
+    local needed_without=$((77 + def_s))
+    local min_without=$((77 + min_s))
+
+    if [ "$tw" -ge "$needed_with" ]; then
+      status_dash=$def_s
+    elif [ "$tw" -ge "$min_with" ]; then
+      status_dash=$((tw - 90))
+    else
+      show_plan=0
+      plan_hidden=1
+      if [ "$tw" -ge "$needed_without" ]; then
+        status_dash=$def_s
+      elif [ "$tw" -ge "$min_without" ]; then
+        status_dash=$((tw - 77))
+      else
+        status_dash=$min_s
+      fi
+    fi
+    status_pad=$((status_dash - 2))
+  fi
+
+  local top mid bot hdr
+  if [ "$show_plan" -eq 1 ]; then
+    top="┌$(table_dash 18)┬$(table_dash 12)┬$(table_dash 27)┬$(table_dash 27)┬$(table_dash "$status_dash")┐"
+    mid="├$(table_dash 18)┼$(table_dash 12)┼$(table_dash 27)┼$(table_dash 27)┼$(table_dash "$status_dash")┤"
+    bot="└$(table_dash 18)┴$(table_dash 12)┴$(table_dash 27)┴$(table_dash 27)┴$(table_dash "$status_dash")┘"
+    hdr="$(printf '│ %-16s │ %-10s │ %-25s │ %-25s │ %-*s │' "ACCOUNT" "PLAN" "CODEX 5H" "CODEX WEEK" "$status_pad" "STATUS")"
+  else
+    top="┌$(table_dash 18)┬$(table_dash 27)┬$(table_dash 27)┬$(table_dash "$status_dash")┐"
+    mid="├$(table_dash 18)┼$(table_dash 27)┼$(table_dash 27)┼$(table_dash "$status_dash")┤"
+    bot="└$(table_dash 18)┴$(table_dash 27)┴$(table_dash 27)┴$(table_dash "$status_dash")┘"
+    hdr="$(printf '│ %-16s │ %-25s │ %-25s │ %-*s │' "ACCOUNT" "CODEX 5H" "CODEX WEEK" "$status_pad" "STATUS")"
+  fi
+
+  echo "$top"
+  echo "$hdr"
+  echo "$mid"
+
+  local row_idx=0
+  while read -r n; do
+    local row_bg=""
+    if [ $((row_idx % 2)) -eq 1 ]; then row_bg="$BG_ALT"; fi
+    row_idx=$((row_idx + 1))
+
+    p5=""; r5=0; pw=""; rw=0; at=0; plan=""
+    snap="$(jq -r --arg n "$n" '.quota[$n] // empty | [.p5,.r5,.pw,.rw,.at,(.plan // "")] | @tsv' "$STATE")"
+    if [ -n "$snap" ]; then IFS=$'\t' read -r p5 r5 pw rw at plan <<<"$snap"; fi
+    if [[ "$failed" == *" $n "* ]]; then p5=""; fi
+    if [ -n "$p5" ] && { [ "$oldest" -eq 0 ] || [ "$at" -lt "$oldest" ]; }; then oldest=$at; fi
+
+    until="$(cooldown_until "$n")"
+    if [[ "$failed" == *" $n "* ]]; then
+      st="measure failed"; sc="$R"
+    elif [ -n "$p5" ] && [ "$pw" -eq 0 ] && [ "$rw" -gt "$t" ]; then
+      st="weekly limit reached, $(fmt_dur $((rw - t))) left"; sc="$R"
+    elif [ "$until" -gt "$t" ]; then
+      st="cooldown, $(fmt_dur $((until - t))) left"; sc="$R"
+    elif [ -z "$p5" ]; then
+      st="not measured"; sc="$Y"
+    elif [ "$r5" -le "$t" ] || [ "$rw" -le "$t" ]; then
+      st="stale, past reset time"; sc="$Y"
+    elif [ "$p5" -le 10 ] || [ "$pw" -le 10 ]; then
+      st="low"; sc="$R"
+    else
+      st="ready"; sc="$G"
+    fi
+
+    mark=" "; if [ "$n" = "$cur" ]; then mark="*"; fi
+
+    local st_disp="$st"
+    if [ "${#st}" -gt "$status_pad" ]; then
+      st_disp="${st:0:$((status_pad - 1))}…"
+    fi
+
+    local plan_disp="${plan:-}"
+    if [ "${#plan_disp}" -gt 10 ]; then
+      plan_disp="${plan_disp:0:9}…"
+    fi
+
+    if [ "$show_plan" -eq 1 ]; then
+      printf '%s│ %s %-14s │ %-10s │ %s │ %s │ %s%-*s%s │%s\n' \
+        "$row_bg" "$mark" "$n" "$plan_disp" "$(cell "$p5" "$r5")" "$(cell "$pw" "$rw")" \
+        "$sc" "$status_pad" "$st_disp" "$Z" "$ALL_RST"
+    else
+      printf '%s│ %s %-14s │ %s │ %s │ %s%-*s%s │%s\n' \
+        "$row_bg" "$mark" "$n" "$(cell "$p5" "$r5")" "$(cell "$pw" "$rw")" \
+        "$sc" "$status_pad" "$st_disp" "$Z" "$ALL_RST"
+    fi
+  done < <(rows_for_list "$failed")
+
+  echo "$bot"
+
+  if [ "$plan_hidden" -eq 1 ]; then
+    echo "(Note: PLAN column hidden to fit terminal width ${tw}. Use 'codexr list -w' to show all)"
+  fi
+  if [ -n "$LIVE" ] && [ -z "$(real_owner)" ]; then
+    echo "${Y}! The login in use matches no slot (just logged in to another account?). Run 'codexr save <name>' to store it; 'codexr use' will not overwrite any slot.${ALL_RST:-$Z}"
+  fi
+  if [ "$live" = 1 ]; then
+    echo "Measured at $(fmt_time "$t")   (* = selected account)"
+  elif [ "$oldest" -gt 0 ]; then
+    echo "Oldest data measured at $(fmt_time "$oldest"). Run 'codexr list' (without -c) to refresh.   (* = selected account)"
+  else
+    echo "No quota data yet; run 'codexr list' (without -c) to measure.   (* = selected account)"
+  fi
+}
+
+# list [-c|--cached] [-w|--wide]: measure every account's real quota (0 tokens, in parallel) and print a table; * = selected account.
+# -c only prints the saved data and does not call codex.
+cmd_list() {
+  need_jq; init_state
+  local cached=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--cached) cached=1 ;;
+      -w|--wide) export CODEXR_WIDE=1 ;;
+      -cw|-wc) cached=1; export CODEXR_WIDE=1 ;;
+      "") ;;
+      *) die "usage: codexr list [-c|--cached] [-w|--wide]" 2 ;;
+    esac
+    shift
+  done
+
+  local -a names=()
+  mapfile -t names < <(slots)
+  if [ "${#names[@]}" -eq 0 ]; then
+    echo "(no accounts yet; log in with 'codexr', then run 'codexr save <name>')"
+    return 0
+  fi
+
+  local failed="" live=0
+  if [ "$cached" -eq 0 ]; then
+    if command -v "$CODEXR_BIN" >/dev/null; then
+      if [ -t 2 ]; then printf 'Measuring quota of %d accounts…' "${#names[@]}" >&2; fi
+      measure_all "${names[@]}"
+      failed="$MEASURE_FAILED"
+      if [ -t 2 ]; then printf '\r\033[K' >&2; fi
+      live=1
+    else
+      echo "codexr: codex not found ($CODEXR_BIN), showing saved data" >&2
+    fi
+  fi
+  print_table "$failed" "$live"
+  [ -z "$failed" ]
+}
+
+cmd_sync() {
+  need_jq; init_state
+  local own=0
+  if [ "$LOCK_HELD" = 0 ]; then lock_acquire; own=1; fi
+  live_load
+  if [ -z "$LIVE" ]; then
+    if [ "$own" = 1 ]; then lock_release; fi
+    return 0
+  fi
+  local snap cur
+  snap="$(live_snapshot)" || {
+    if [ "$own" = 1 ]; then lock_release; fi
+    return 0
+  }
+  cur="$(owner_of "$snap")"
+  if [ -n "$cur" ]; then
+    atomic_cp "$snap" "$ACCTS/$cur.json" || true
+  fi
+  rm -f "$snap"
+  if [ "$own" = 1 ]; then lock_release; fi
+  return 0
+}
+
+# run [codex args...]: start codex with credentials store set to file and write back refreshed login.
+cmd_run() {
+  command -v "$CODEXR_BIN" >/dev/null || die "codex not found ($CODEXR_BIN)"
+  local has_model=0 has_effort=0 arg
+  for arg in "$@"; do
+    if [ "$arg" = "-m" ] || [ "$arg" = "--model" ] || [[ "$arg" == -m=* ]] || [[ "$arg" == --model=* ]]; then
+      has_model=1
+    fi
+    if [[ "$arg" == *model_reasoning_effort* ]]; then
+      has_effort=1
+    fi
+  done
+  local -a cmd=("$CODEXR_BIN" -c cli_auth_credentials_store="file")
+  if [ "$has_model" -eq 0 ]; then
+    cmd+=(-m "$CODEXR_DEFAULT_MODEL")
+  fi
+  if [ "$has_effort" -eq 0 ]; then
+    cmd+=(-c model_reasoning_effort="$CODEXR_DEFAULT_EFFORT")
+  fi
+  cmd+=("$@")
+
+  local rc=0
+  "${cmd[@]}" || rc=$?
+  cmd_sync
+  exit "$rc"
+}
+
+# ---- codexr test: send "Hi" to every account -------------------------------------------------------------------------------
+# One real request per account, so it uses a little quota. Purpose: the 5-hour
+# window of an account starts counting down from its first request, so this starts every account's window now.
+
+# hi_call <home> <codex_home> <name>: run 'codex exec "Hi"' in an empty temp directory with CODEX_HOME=<home>, the private copy
+# of the slot's login that measure_one made (measure_one writes a refreshed login back to the slot and to the login in use,
+# so nothing is written back here), detached from the terminal with a timeout. Prints one line  STATUS<US>reply<US>error
+# (US = unit separator; reply/error on one line, cut at 200/40 chars) or returns 1 when no result was produced.
+hi_call() {
+  local home="${1:-}" name="${3:-}"
+  [ -n "$name" ] && [ -f "$home/auth.json" ] || return 1
+
+  local tmpdir
+  tmpdir="$(mktemp -d)" || return 1
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  local cdir home_arg
+  cdir="$(platform_arg_path "$tmpdir")"
+  home_arg="$(platform_arg_path "$home")"
+  local -a cap=()
+  if command -v timeout >/dev/null; then
+    cap=(timeout "${CODEXR_TEST_TIMEOUT:-120}")
+  fi
+  local effort="${CODEXR_TEST_EFFORT:-low}"
+  local raw rc=0
+  raw="$(cd "$tmpdir" && env CODEX_HOME="$home_arg" "${PLATFORM_DETACH_WAIT[@]}" "${cap[@]}" \
+    "$CODEXR_BIN" exec --json --skip-git-repo-check --ephemeral -s read-only -C "$cdir" \
+    -m "$CODEXR_DEFAULT_MODEL" \
+    -c model_reasoning_effort="$effort" \
+    -c cli_auth_credentials_store="file" \
+    "Hi" </dev/null 2>&1)" || rc=$?
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+
+  local st="" resp="" err=""
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    st="ERROR"
+    err="timeout: codex gave no answer"
+  fi
+
+  local json_ans="" json_err=""
+  if [ -n "$raw" ]; then
+    local parsed
+    parsed="$(grep '^{' <<<"$raw" | jq -s -c '
+      [ .[] | select(type == "object") ] as $ev |
+      # only an error after the last turn.completed counts: codex also reports transient errors (reconnecting) before it
+      ([ $ev | to_entries[] | select((.value.type // .value.event // "") == "turn.completed") | .key ] | last // -1) as $done |
+      {
+        answer: ([ $ev[] |
+          if ((.type // .event // "") == "item.completed") and (((.item.type // .item_type // "") == "agent_message")) then
+            (.item.text // .text // "")
+          else empty end
+        ] | last // ""),
+        error: ([ $ev | to_entries[] | select(.key > $done) | .value |
+          if ((.type // .event // "") | test("^(error|turn\\.failed)$"; "i")) then
+            (.message // .error.message // (if (.error | type) == "string" then .error else empty end) // "")
+          else empty end
+        ] | last // "")
+      }
+    ' 2>/dev/null || true)"
+    if [ -n "$parsed" ]; then
+      json_ans="$(jq -r '.answer // empty' <<<"$parsed" 2>/dev/null || true)"
+      json_err="$(jq -r '.error // empty' <<<"$parsed" 2>/dev/null || true)"
+      if [ -n "$json_err" ]; then
+        st="ERROR"
+        err="$json_err"
+      elif [ -z "$st" ] && [ -n "$json_ans" ] && [ "$rc" -eq 0 ]; then
+        st="SUCCESS"
+        resp="$json_ans"
+      fi
+    fi
+  fi
+
+  if [ -z "$st" ]; then
+    if [ "$rc" -ne 0 ]; then
+      st="ERROR"
+      local line_err
+      line_err="$(grep -v '^{' <<<"$raw" | grep -v '^[[:space:]]*$' | head -n 1)"
+      if [ -n "$line_err" ]; then
+        err="$line_err"
+      else
+        err="exit code $rc"
+      fi
+    elif [ -n "$json_ans" ]; then
+      st="SUCCESS"
+      resp="$json_ans"
+    else
+      st="NO_RESULT"
+    fi
+  fi
+
+  [ -z "$resp" ] || resp="$(tr '\r\n\t' ' ' <<<"$resp" | sed 's/  */ /g; s/^ //; s/ $//')"
+  [ -z "$err" ] || err="$(tr '\r\n\t' ' ' <<<"$err" | sed 's/  */ /g; s/^ //; s/ $//')"
+  [ -z "$err" ] || err="${err:0:40}"
+  [ -z "$resp" ] || resp="${resp:0:200}"
+
+  if [ "$st" = "NO_RESULT" ] || [ -z "$st" ]; then
+    return 1
+  fi
+  printf '%s\x1f%s\x1f%s\n' "$st" "$resp" "$err"
+}
+
+# the probe measure_all runs for 'codexr test': quota before, "Hi", quota after (prints the raw quota output of the last one)
+test_probe() {
+  local home="$1" c_home="$2" name="$3" t0 res
+  quota_fetch "$home" "$c_home" >"$TEST_DIR/$name.before" 2>/dev/null || : >"$TEST_DIR/$name.before"
+  t0="$(date +%s)"
+  res="$(hi_call "$home" "$c_home" "$name")" || res="NO_RESULT"$'\x1f'$'\x1f'
+  printf '%s\x1f%s\n' "$res" "$(($(date +%s) - t0))" >"$TEST_DIR/$name.hi"
+  quota_fetch "$home" "$c_home"
+}
+
+# the ingest for 'codexr test': store the quota; the account counts as failed unless it answered "Hi" and its quota was readable
+test_ingest() {
+  local name="$1" raw="$2" st
+  quota_ingest "$name" "$raw" || return 1
+  st="$(cut -d$'\x1f' -f1 "$TEST_DIR/$name.hi" 2>/dev/null)"
+  [ "$st" = SUCCESS ] || return 1
+  return 0
+}
+
+use_color() {
+  case "${CODEXR_COLOR:-auto}" in always) return 0 ;; never) return 1 ;; *) [ -t 1 ] && [ -z "${NO_COLOR:-}" ] ;; esac
+}
+
+# table for 'codexr test'; every account of this run has its files in $TEST_DIR
+print_test_table() {
+  local n st resp err secs txt hcol before after reset b_epoch diff
+  local G="" Y="" R="" Z="" BG_ALT="" ALL_RST=""
+  if use_color; then
+    G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; Z=$'\033[39m'
+    ALL_RST=$'\033[0m'
+    case "${COLORFGBG:-}" in
+      *";15"|"0;"*) BG_ALT=$'\033[48;5;254m' ;;
+      *) BG_ALT=$'\033[48;5;236m' ;;
+    esac
+  fi
+
+  local is_tty=0; [ -t 1 ] && is_tty=1
+  local tw; tw="$(term_width "$is_tty")"
+  local hi_dash=48 hi_pad=46
+  local rst_dash=37 rst_pad=35
+
+  if [ "$tw" -gt 0 ] && [ "$tw" -lt 122 ]; then
+    local avail=$((tw - 1 - 18 - 1 - 14 - 1 - 2))
+    [ "$avail" -lt 36 ] && avail=36
+    hi_dash=$((avail * 55 / 100))
+    rst_dash=$((avail - hi_dash))
+    [ "$hi_dash" -lt 18 ] && hi_dash=18
+    [ "$rst_dash" -lt 18 ] && rst_dash=18
+    hi_pad=$((hi_dash - 2))
+    rst_pad=$((rst_dash - 2))
+  fi
+
+  local top mid bot test_hdr
+  top="┌$(table_dash 18)┬$(table_dash "$hi_dash")┬$(table_dash 14)┬$(table_dash "$rst_dash")┐"
+  mid="├$(table_dash 18)┼$(table_dash "$hi_dash")┼$(table_dash 14)┼$(table_dash "$rst_dash")┤"
+  bot="└$(table_dash 18)┴$(table_dash "$hi_dash")┴$(table_dash 14)┴$(table_dash "$rst_dash")┘"
+  test_hdr="$(printf '│ %-16s │ %-*s │ %-12s │ %-*s │' "ACCOUNT" "$hi_pad" "HI" "CODEX 5H" "$rst_pad" "RESETS")"
+  echo "$top"
+  echo "$test_hdr"
+  echo "$mid"
+
+  local row_idx=0
+  while read -r n; do
+    local row_bg=""
+    if [ $((row_idx % 2)) -eq 1 ]; then row_bg="$BG_ALT"; fi
+    row_idx=$((row_idx + 1))
+    if [ -n "${TEST_SKIP[$n]:-}" ]; then
+      local skip_txt="skipped (${TEST_SKIP[$n]})"
+      [ "${#skip_txt}" -gt "$hi_pad" ] && skip_txt="${skip_txt:0:$((hi_pad - 1))}…"
+      printf '%s│ %-16s │ %s%-*s%s │ %-12s │ %-*s │%s\n' "$row_bg" "  $n" "$Y" "$hi_pad" "$skip_txt" "$Z" "-" "$rst_pad" "-" "$ALL_RST"
+      continue
+    fi
+    [ -n "${TEST_TRY[$n]:-}" ] || continue
+    st="" resp="" err="" secs=""
+    IFS=$'\x1f' read -r st resp err secs <"$TEST_DIR/$n.hi" || true
+
+    if [ "$st" = SUCCESS ]; then
+      txt="ok in ${secs}s"; [ -z "$resp" ] || txt="$txt: \"${resp:0:24}\""; hcol="$G"
+    elif [ "$st" = NO_RESULT ] || [ -z "$st" ]; then
+      txt="failed: codex gave no answer (${secs:-?}s)"; hcol="$R"
+    else
+      if [[ "$err" =~ ^failed: ]]; then
+        txt="$err"
+      else
+        txt="failed: ${err:-$st}"
+      fi
+      hcol="$R"
+    fi
+    [ "${#txt}" -le "$hi_pad" ] || txt="${txt:0:$((hi_pad - 3))}..."
+
+    before="" b_epoch=""
+    if [ -s "$TEST_DIR/$n.before" ]; then
+      local bsnap
+      bsnap="$(jq -r '
+        (.result // .) as $root | ($root.rateLimits // empty) as $rl |
+        [ (if ($rl.rateLimitReachedType // null) != null or $root.ordinaryUsageAllowed == false then "off"
+           elif $rl.primary.usedPercent != null then ((100 - ($rl.primary.usedPercent | tonumber) | round | tostring) + "%")
+           else "" end),
+          (($rl.primary.resetsAt // "") | tostring) ] | join("|")' "$TEST_DIR/$n.before" 2>/dev/null || true)"
+      before="${bsnap%%|*}" b_epoch="${bsnap#*|}"
+    fi
+
+    # the measurement after the request was stored by quota_ingest (test_ingest)
+    local asnap p5 r5
+    asnap="$(jq -r --arg n "$n" '.quota[$n] // empty | [(.p5 // ""), (.r5 // 0)] | join("|")' "$STATE" 2>/dev/null || true)"
+    p5="${asnap%%|*}" r5="${asnap#*|}"
+    after="${p5:+$p5%}"
+    reset="-"; [ -z "$r5" ] || [ "$r5" = 0 ] || reset="$(fmt_time "$r5")"
+    # did the reset time move? (that is what shows that the request started a new 5-hour window)
+    if [[ "$b_epoch" =~ ^[0-9]+$ ]] && [[ "$r5" =~ ^[0-9]+$ ]] && [ "$r5" != 0 ]; then
+      diff=$((r5 - b_epoch)); if [ "$diff" -lt 0 ]; then diff=$((-diff)); fi
+      if [ "$diff" -gt 120 ]; then reset="$reset (was $(date -d "@$b_epoch" '+%I:%M %p'))"; fi
+    fi
+    local reset_disp="$reset"
+    [ "${#reset}" -gt "$rst_pad" ] && reset_disp="${reset:0:$((rst_pad - 1))}…"
+
+    printf '%s│ %-16s │ %s%-*s%s │ %-12s │ %-*s │%s\n' "$row_bg" "  $n" "$hcol" "$hi_pad" "$txt" "$Z" "${before:-?}>${after:-?}" "$rst_pad" "$reset_disp" "$ALL_RST"
+  done < <(slots)
+  echo "$bot"
+  echo "Measured at $(fmt_time "$(now)")   (CODEX 5H = before>after; RESETS = end of the account's current 5-hour window; \"(was ...)\" = it moved because of the Hi)"
+}
+
+# test [name...]: send "Hi" to every account (or only the named ones) and show what it cost
+cmd_test() {
+  need_jq; init_state
+  command -v "$CODEXR_BIN" >/dev/null || die "codex not found ($CODEXR_BIN)"
+  local a n t until
+  local -a all=() names=() args=()
+  for a in "$@"; do
+    case "$a" in
+      -w|--wide) export CODEXR_WIDE=1 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  set -- "${args[@]}"
+  for a in "$@"; do
+    valid_name "$a"
+    [ -f "$ACCTS/$a.json" ] || die "no slot '$a' (see: codexr list)"
+  done
+  mapfile -t all < <(slots)
+  if [ "${#all[@]}" -eq 0 ]; then echo "(no accounts yet; log in with 'codexr', then run 'codexr save <name>')"; return 0; fi
+  TEST_TRY=() TEST_SKIP=()
+  t="$(now)"
+  if [ $# -gt 0 ]; then
+    for n in "$@"; do
+      if [ -z "${TEST_TRY[$n]:-}" ]; then TEST_TRY[$n]=1; names+=("$n"); fi
+    done
+  else
+    for n in "${all[@]}"; do
+      until="$(cooldown_until "$n")"
+      if [ "$until" -gt "$t" ]; then TEST_SKIP[$n]="cooldown, $(fmt_dur $((until - t))) left"; else TEST_TRY[$n]=1; names+=("$n"); fi
+    done
+  fi
+  if [ "${#names[@]}" -eq 0 ]; then
+    echo "nothing to do: every account is on cooldown (name an account to send it \"Hi\" anyway: codexr test <name>)"
+    return 0
+  fi
+  echo "Sending \"Hi\" to ${#names[@]} account(s): one real request each, so it uses a little quota..." >&2
+  TEST_DIR="$(mktemp -d)"
+  PROBE_FN=test_probe INGEST_FN=test_ingest
+  measure_all "${names[@]}"
+  PROBE_FN=quota_fetch INGEST_FN=quota_ingest
+  local failed="$MEASURE_FAILED"
+  print_test_table
+  rm -rf "$TEST_DIR"; TEST_DIR=""
+  [ -z "$failed" ]
+}
+
+cmd_active() { need_jq; init_state; active_name; }
+
+# forget [--force]: drop the login in use LOCALLY so codex asks for a new login.
+# Refuses when the login belongs to no slot (it would be lost), unless --force; it is always backed up first.
+cmd_forget() {
+  local force=0
+  case "${1:-}" in
+    "") ;;
+    -f|--force) force=1 ;;
+    *) die "usage: codexr forget [-f|--force]" 2 ;;
+  esac
+  need_jq; init_state
+  lock_acquire
+  live_load # again: the login may have changed while waiting for the lock
+  if [ -z "$LIVE" ]; then echo "no login in use; nothing to forget"; lock_release; return 0; fi
+  local snap cur
+  snap="$(live_snapshot)"; cur="$(owner_of "$snap")"
+  if [ -z "$cur" ] && [ "$force" = 0 ]; then
+    rm -f "$snap"
+    die "the login in use matches no slot, so forgetting it would lose it: run 'codexr save <name>' first (or 'codexr forget --force'; it is kept in $ACCTS/.last-token.bak either way)"
+  fi
+  atomic_cp "$snap" "$ACCTS/.last-token.bak"
+  if [ -n "$cur" ]; then atomic_cp "$snap" "$ACCTS/$cur.json"; fi # keep the freshest copy
+  rm -f "$snap"
+  live_clear
+  state_update '.active=""' # nobody is logged in now: 'codexr active' prints nothing and codex-run stops with "no active account"
+  lock_release
+  echo "login removed from this machine${cur:+ (still saved as slot '$cur')}; nothing was revoked at OpenAI."
+  echo "run 'codexr' to log in to another account, then 'codexr save <name>'"
+}
+
+usage() {
+  cat <<EOF
+codexr — rotate between multiple OpenAI codex (ChatGPT) accounts
+
+Usage: codexr <command> [args]        (codexr help <command> for the details of one command)
+       codexr [codex arguments]      start codex with the selected account (same as 'codexr run')
+
+Commands:
+  list [-c] [-w]           Measure every account's quota and show a table (* = selected account)
+  save <name>              Save the current login as slot <name>
+  use <name>               Switch to slot <name>
+  swapui <n1> <n2>         Swap UI display order of two accounts in 'codexr list' (--reset to restore)
+  rename <old> <new>       Rename a slot (its login, cooldown and quota data move with it)
+  del <name>               Delete slot <name> permanently (alias: rm)
+  active                   Print the name of the account in use
+  run [args]               Start codex with the selected account; plain 'codexr' does the same
+  rotate [duration]        Interactive codex ran out of quota: cool this account down, switch to next
+  next [-v]                Print the ready account whose weekly limit resets soonest (what codex-run switches to)
+  cooldown <name> [time]   Mark an account as out of quota (no duration = probe the quota)
+  clear <name>             Remove an account's cooldown
+  test [name...]           Send "Hi" to every account (uses a little real quota) to start each 5-hour window
+  forget [-f]              Drop the login in use locally, so 'codexr' asks for a new login
+  sync                     Internal: write the live login back into its slot
+  help [command]           This overview, or the details of one command
+
+Typical use:
+  codexr save work           After logging in with 'codexr': store that login as slot 'work' (once per account)
+  codexr list                Which account still has quota?
+  codexr use other           Switch account, then reopen codex with 'codexr'
+  codexr rotate              codex ran out of quota: cool this account down and switch
+
+Exit codes:   0 ok | 1 error (or an account could not be measured) | 2 bad usage | 3 no account is ready
+Environment:  CODEX_HOME (default ~/.codex) | CODEXR_BIN (default codex) |
+              CODEXR_MODEL (default ${CODEXR_DEFAULT_MODEL}) | CODEXR_EFFORT (default ${CODEXR_DEFAULT_EFFORT}) |
+              CODEXR_TZ (default UTC-7, i.e. UTC+7) | CODEXR_COLOR=auto|always|never (also NO_COLOR) |
+              CODEXR_TEST_TIMEOUT (default 120) | CODEXR_TEST_EFFORT (default low) |
+              CODEXR_PROBE_TIMEOUT
+Files:        \$CODEX_HOME/accounts/<name>.json (slots), accounts/state.json (active account, cooldowns,
+              last measured quota), accounts/.last-token.bak (auth file replaced by the last 'use')
+Also:         codex-run --help   (runs a codex task headless with automatic account rotation)
+              codex-task --help  (runs a delegated task in a dedicated git worktree)
+EOF
+}
+
+# codexr help [command] / codexr <command> --help
+help_for() {
+  case "${1:-}" in
+    "") usage ;;
+    save) cat <<'EOF'
+Usage: codexr save <name>
+
+Save the login currently in use ($CODEX_HOME/auth.json) as slot <name> and make <name> the active account.
+<name> may contain letters, digits, '-' and '_'.
+
+Run it once per account after logging in with 'codexr', and again after every manual re-login.
+EOF
+      ;;
+    use) cat <<'EOF'
+Usage: codexr use <name>
+
+Switch to slot <name>. The login currently in use is first written back to the slot it belongs to (matched by
+account identity, so tokens that codex refreshed in place are not lost). A login that matches no slot is never
+written into any slot; it stays in accounts/.last-token.bak.
+
+A running codex keeps its old credentials: reopen codex after switching.
+EOF
+      ;;
+    swapui) cat <<'EOF'
+Usage: codexr swapui <name1> <name2>
+       codexr swapui --reset
+
+Swap the display positions of two accounts in 'codexr list' without affecting account rotation ('codexr next').
+
+Use --reset (or 'reset') to clear custom UI ordering and restore default weekly reset order.
+EOF
+      ;;
+    list|ls) cat <<'EOF'
+Usage: codexr list [-c|--cached] [-w|--wide]        (alias: ls)
+
+Measure the real quota of every saved account using the codex app-server probe (no model call, 0 tokens) and
+print one table row per account. The accounts are measured in parallel, each in a temporary CODEX_HOME holding
+a copy of its auth.json, so the login in use is never touched and running codex / codex-run processes are not
+disturbed.
+
+Rows are ordered by when the weekly limit resets, soonest first (accounts without data, never measured or just
+failed, come last); this is the order in which the weekly limits free up.
+
+  *            marks the account the real auth file belongs to
+  PLAN         account subscription plan (plus, pro, team, ...)
+  CODEX 5H     % left of the 5-hour limit and when it resets
+  CODEX WEEK   % left of the weekly limit and when it resets
+  STATUS       ready | low (10% or less left) | weekly limit reached, <time> left (the 5-hour limit then shows 'off':
+               it does not apply) | cooldown, <time> left | not measured | stale, past reset time | measure failed
+
+An account at 0% automatically gets a cooldown until its reset time; an account with quota left has its cooldown cleared.
+Colours: green above 40%, yellow 11-40%, red 10% or less. Only on a terminal (see NO_COLOR and CODEXR_COLOR).
+
+Options:
+  -c, --cached   do not call codex; print the data saved by the last measurement
+  -w, --wide     disable responsive table; always print all columns at full width
+
+Exit code: 0 ok, 1 some account could not be measured.
+EOF
+      ;;
+    rename) cat <<'EOF'
+Usage: codexr rename <old> <new>
+
+Rename slot <old> to <new>. The saved login, the cooldown, the last measured quota and the "active" mark move with it.
+The real auth file is not touched and codex is not started. Names may contain letters, digits, '-' and '_'.
+
+It refuses (exit 1, nothing changed) if <old> does not exist or <new> already exists. Do not rename a slot while a
+codex-run is using it: codex-run remembers the name it started with.
+EOF
+      ;;
+    del|rm) cat <<'EOF'
+Usage: codexr del <name>        (alias: rm)
+
+Permanently delete slot <name> from the pool.
+
+Removes the slot file accounts/<name>.json and deletes <name> from active, cooldown, and quota state. If the login
+currently in use belongs to <name>, it is also cleared (removing the live auth.json), and accounts/.last-token.bak
+is removed if it belonged to <name>.
+EOF
+      ;;
+    active) cat <<'EOF'
+Usage: codexr active
+
+Print the name of the account in use: the slot the real auth file belongs to (matched by account identity). If the auth
+file matches no slot, the name stored in state is printed instead. Prints nothing when there is no active account.
+EOF
+      ;;
+    cooldown) cat <<'EOF'
+Usage: codexr cooldown <name> [<time>]
+
+Mark <name> as out of quota for <time>; 'next', 'rotate' and codex-run skip it until then.
+When <time> is omitted, probes the account's quota via app-server and sets cooldown from its resetsAt.
+
+<time> accepts 4h13m27s, 43m, 1d2h, plain seconds (90), or a whole sentence containing a duration.
+If it cannot be parsed, default 5h is used.
+
+'codexr list' sets and clears cooldowns by itself from the measured quota, so this is rarely needed by hand.
+EOF
+      ;;
+    clear) cat <<'EOF'
+Usage: codexr clear <name>
+
+Remove the cooldown of <name>.
+EOF
+      ;;
+    next) cat <<'EOF'
+Usage: codexr next [-v|--why]
+
+Print the account to switch to: among the ready accounts (those not on cooldown) the one whose weekly limit resets soonest, from
+the last measurement; this is the order 'codexr list' shows. Accounts never measured come last, ties are broken by name. The
+account in use is returned only when nothing else is ready. 'codex-run' and 'codexr rotate' use this to pick the next account,
+so keep the numbers fresh with 'codexr list'.
+If every account is on cooldown: print nothing, report on stderr which one resets first, and exit 3.
+  -v, --why   also say on stderr which account was chosen and why
+EOF
+      ;;
+    rotate) cat <<'EOF'
+Usage: codexr rotate [<duration>]
+
+For when an interactive codex runs out of quota: put the active account on cooldown and switch to the next ready one.
+Pass <duration> (for example 4h13m) to set the cooldown duration; if omitted, probes the quota or uses default 5h.
+
+Then reopen codex with the new account.
+Exit code 3, and no switch, if every account is on cooldown.
+EOF
+      ;;
+    run) cat <<EOF
+Usage: codexr run [codex arguments...]        (shorthand: codexr [codex arguments...])
+
+Start codex using the login saved in the active slot (selected by 'codexr use' / 'codexr rotate' / 'codexr next').
+Defaults to model ${CODEXR_DEFAULT_MODEL} with reasoning effort ${CODEXR_DEFAULT_EFFORT}.
+Passes -c cli_auth_credentials_store="file" to ensure file-based auth is used.
+
+Shorthand: 'codexr' alone, or 'codexr' followed by flags, is the same as 'codexr run ...'.
+Note: '--help' / '-h' as the first argument shows codexr's help instead of being passed to codex.
+EOF
+      ;;
+    test) cat <<EOF
+Usage: codexr test [-w|--wide] [<name>...]
+
+Send "Hi" to every account (or only the named ones) and show what it did: this is ONE REAL REQUEST per account, so it uses a
+little real quota.
+
+Why: the idea is that an account's 5-hour limit window starts counting down at its first request, so one "Hi" per account
+starts every window at the same moment. THAT IS AN ASSUMPTION, not something OpenAI documents: check it. The RESETS column
+shows the reset time after the call and, when the call moved it, "(was hh:mm)" with the time before; if nothing moved for an
+account that had not been used, the Hi did not start a new window.
+
+For each account it measures the quota (0 tokens), sends "Hi" with 'codex exec "Hi"' (default model ${CODEXR_DEFAULT_MODEL},
+reasoning effort \${CODEXR_TEST_EFFORT:-low}, read-only sandbox, empty temporary directory, nothing of yours is read),
+then measures again. The table shows the reply (or the error), the 5-hour % before>after and the reset time. The accounts
+are handled in parallel, the login in use is never touched, and refreshed tokens are written back to their slots.
+
+Without names, accounts that are on cooldown (out of quota) are skipped. A named account is always tried.
+
+Options:
+  -w, --wide     disable responsive table; always print all columns at full width
+
+Exit code: 0 if every tried account answered, 1 if some did not.
+Environment:
+  CODEXR_TEST_TIMEOUT  seconds an account may take (default 120)
+  CODEXR_TEST_EFFORT   reasoning effort for the ping (default low)
+EOF
+      ;;
+    forget) cat <<'EOF'
+Usage: codexr forget [-f|--force]
+
+Remove the login in use from THIS machine only ($CODEX_HOME/auth.json), so the next 'codexr' asks you to log in again.
+Nothing is revoked at OpenAI.
+Use it between logging in to different accounts: 'codexr' (log in), 'codexr save <name>', 'codexr forget', 'codexr' (next account)...
+
+The login is backed up in accounts/.last-token.bak first. If it belongs to no slot it would be lost, so forget refuses
+until you run 'codexr save <name>' (or pass -f / --force). It also clears the "active" mark, so 'codexr active' prints nothing and
+codex-run refuses to start (exit 4) until a login exists again. Do not forget while a codex-run is running.
+EOF
+      ;;
+    sync) cat <<'EOF'
+Usage: codexr sync
+
+Internal: write the live login back into its slot if refreshed.
+EOF
+      ;;
+    help) cat <<'EOF'
+Usage: codexr help [<command>]
+
+Show the overview, or the details of one command. 'codexr <command> --help' works too.
+EOF
+      ;;
+    *) echo "codexr: no such command '$1'" >&2; usage >&2; return 2 ;;
+  esac
+}
+
+main() {
+  # bare 'codexr' and 'codexr -<flag> ...' start codex (same as 'codexr run ...'); only -h/--help show codexr's help
+  if [ $# -eq 0 ]; then cmd_run; fi
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -*) cmd_run "$@" ;;
+  esac
+  local c="$1"; shift
+  # codexr <command> --help
+  case "${1:-}" in
+    -h|--help) if [ -n "$c" ]; then help_for "$c"; exit $?; fi ;;
+  esac
+  # commands that look at the login in use (cmd_use loads it itself, under the lock)
+  case "$c" in save|list|ls|active|next|rotate) live_load ;; esac
+  case "$c" in
+    sync) cmd_sync "$@" ;;
+    save) cmd_save "$@" ;;
+    use) cmd_use "$@" ;;
+    swapui) cmd_swapui "$@" ;;
+    rename) cmd_rename "$@" ;;
+    del|rm) cmd_del "$@" ;;
+    forget) cmd_forget "$@" ;;
+    test) cmd_test "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    active) cmd_active "$@" ;;
+    cooldown) cmd_cooldown "$@" ;;
+    clear) cmd_clear "$@" ;;
+    next) cmd_next "$@" ;;
+    rotate) cmd_rotate "$@" ;;
+    run) cmd_run "$@" ;;
+    "") usage ;;
+    help) help_for "$@" ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+main "$@"

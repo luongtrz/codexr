@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# codex-run — run one codex task; when the account runs out of quota, stop codex, switch to
+# another account with codexr and resume the very same thread.
+#
+# Usage:
+#   codex-run --prompt FILE --add-dir DIR --log FILE.jsonl [--model M] [--effort E] [--sandbox MODE] [--yolo] [--conversation ID]
+#
+# Exit codes:
+#   0 success | 1 other codex failure | 2 bad arguments
+#   4 login error (the user must log in again) | 5 whole pool out of quota | 6 switched accounts too many times
+#
+# Environment variables:
+#   CODEX_HOME            codex data directory (default ~/.codex)
+#   CODEXR_BIN           codex binary (default codex)
+#   CODEXR_MODEL         override default model (default gpt-6-luna)
+#   CODEXR_EFFORT        override default reasoning effort (default max)
+#   CODEX_RUN_POLL       seconds between two looks at the log (default 1)
+#   CODEX_RUN_MAX_SWITCH maximum number of account switches (default 10)
+#   CODEX_RUN_SANDBOX    default sandbox mode (default workspace-write)
+set -uo pipefail
+
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;; *) PLATFORM=linux ;; esac
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SCRIPT_DIR/../platforms/$PLATFORM/platform.sh"
+. "$SCRIPT_DIR/../lib/defaults.sh"
+platform_init
+
+CODEXR_BIN="${CODEXR_BIN:-codex}"
+CODEXR="${CODEXR:-${CODEXR_ACCT:-}}"
+if [ -z "$CODEXR" ]; then
+  dir_codexr="$SCRIPT_DIR/codexr"
+  if [ -x "$dir_codexr" ] || [ -f "$dir_codexr" ]; then
+    CODEXR="$dir_codexr"
+  elif command -v codexr >/dev/null 2>&1; then
+    CODEXR="codexr"
+  else
+    CODEXR="$dir_codexr"
+  fi
+fi
+
+POLL="${CODEX_RUN_POLL:-1}"
+MAX_SWITCH="${CODEX_RUN_MAX_SWITCH:-10}"
+SANDBOX="${CODEX_RUN_SANDBOX:-workspace-write}"
+MODEL="$CODEXR_DEFAULT_MODEL"
+EFFORT="$CODEXR_DEFAULT_EFFORT"
+YOLO=0
+
+# Login failures. Only looked for in error / turn.failed events and in plain stderr lines, never in agent output or
+# tool results (code the agent reads or writes may contain any of these words).
+AUTH_RE="refresh token|sign in again|log out and sign in|not logged in|401 unauthorized|invalid_api_key"
+
+usage() {
+  cat <<EOF
+codex-run — run one codex task headless, rotating accounts when one runs out of quota
+
+Usage: codex-run --prompt FILE --add-dir DIR --log FILE.jsonl [--model M] [--effort E] [--sandbox MODE] [--yolo] [--conversation ID]
+
+  --prompt FILE       file containing the task prompt
+  --add-dir DIR       directory codex may work in (passed as -C DIR; for code changes use a dedicated git worktree)
+  --log FILE          JSONL log of the run (keep it as an audit trail)
+  --model M           model to use (default ${CODEXR_DEFAULT_MODEL})
+  --effort E          reasoning effort level (default ${CODEXR_DEFAULT_EFFORT})
+  --sandbox MODE      sandbox mode: read-only | workspace-write (default workspace-write)
+  --yolo              bypass approvals and sandbox (--dangerously-bypass-approvals-and-sandbox)
+  --conversation ID   resume an earlier conversation instead of starting fresh
+
+codex runs with codex exec --json. As soon as an error or turn.failed event indicates a usage limit,
+codex is stopped immediately, the account gets a cooldown, codexr switches to the next ready account
+and the same conversation is resumed with codex exec resume <thread_id>.
+
+Exit codes:   0 done | 1 codex failed otherwise | 2 bad arguments | 4 login error or no active account |
+              5 whole pool out of quota | 6 switched accounts too many times
+Environment:  CODEX_HOME | CODEXR_BIN | CODEXR_MODEL | CODEXR_EFFORT | CODEX_RUN_POLL (seconds, default 1) |
+              CODEX_RUN_MAX_SWITCH (default 10) | CODEX_RUN_SANDBOX (default workspace-write)
+See also:     codexr help
+EOF
+}
+
+log() { echo "[codex-run] $*" >&2; }
+die() { log "$1"; exit "${2:-1}"; }
+
+abs_path() {
+  local p="$1"
+  case "$p" in
+    /*|[A-Za-z]:[\\/]*) printf '%s\n' "$p" ;;
+    *) printf '%s/%s\n' "$PWD" "$p" ;;
+  esac
+}
+
+PROMPT_FILE="" ADD_DIR="" LOG_FILE="" CONV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt)
+      PROMPT_FILE="${2:-}"
+      [ -n "$PROMPT_FILE" ] || die "--prompt requires a file argument" 2
+      shift 2
+      ;;
+    --add-dir)
+      ADD_DIR="${2:-}"
+      [ -n "$ADD_DIR" ] || die "--add-dir requires a directory argument" 2
+      shift 2
+      ;;
+    --log)
+      LOG_FILE="${2:-}"
+      [ -n "$LOG_FILE" ] || die "--log requires a file argument" 2
+      shift 2
+      ;;
+    --model)
+      MODEL="${2:-}"
+      [ -n "$MODEL" ] || die "--model requires a model name" 2
+      shift 2
+      ;;
+    --effort)
+      EFFORT="${2:-}"
+      [ -n "$EFFORT" ] || die "--effort requires an effort level" 2
+      shift 2
+      ;;
+    --sandbox)
+      SANDBOX="${2:-}"
+      [ -n "$SANDBOX" ] || die "--sandbox requires a mode (read-only or workspace-write)" 2
+      shift 2
+      ;;
+    --yolo)
+      YOLO=1
+      shift
+      ;;
+    --conversation)
+      CONV="${2:-}"
+      [ -n "$CONV" ] || die "--conversation requires an ID" 2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1 (usage: --prompt FILE --add-dir DIR --log FILE [--model M] [--effort E] [--sandbox MODE] [--yolo] [--conversation ID]; see --help)" 2
+      ;;
+  esac
+done
+
+[ -f "$PROMPT_FILE" ] || die "--prompt must be an existing file" 2
+[ -d "$ADD_DIR" ] || die "--add-dir must be an existing directory" 2
+[ -n "$LOG_FILE" ] || die "missing --log" 2
+case "$SANDBOX" in
+  read-only|workspace-write) ;;
+  *) die "--sandbox must be read-only or workspace-write (got '$SANDBOX')" 2 ;;
+esac
+
+PROMPT_FILE="$(abs_path "$PROMPT_FILE")"
+ADD_DIR="$(abs_path "$ADD_DIR")"
+LOG_FILE="$(abs_path "$LOG_FILE")"
+
+CUR="$("$CODEXR" active)" || die "codexr failed" 1
+[ -n "$CUR" ] || die "no active account; log in, then run: codexr save <name>" 4
+
+ORIG_PROMPT="$(cat "$PROMPT_FILE")"
+RESUME_NOTE="Continue the task from where you stopped. The previous account ran out of quota mid-run, so partial uncommitted edits may already exist in the working directory: check git status/diff first, finish them (do not run tests, builds or linters: the harness verifies afterwards), do not revert them."
+
+PROMPT_TMP="$(mktemp "${TMPDIR:-/tmp}/codex-run-prompt.XXXXXX")" || die "cannot create a temp file" 1
+trap 'rm -f "$PROMPT_TMP"' EXIT
+PID=""
+OFF=0
+LAST_CHUNK=""
+
+stop_codex() { # kill the whole process group (Windows: the whole process tree, see platform_kill_tree), then reap it
+  if declare -F platform_kill_tree >/dev/null && platform_kill_tree "$PID"; then return 0; fi
+  kill -TERM -- "-$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null
+  sleep 0.2
+  kill -KILL -- "-$PID" 2>/dev/null || kill -KILL "$PID" 2>/dev/null
+  wait "$PID" 2>/dev/null || true
+  return 0
+}
+
+thread_id_from_log() { # thread_id of the first thread.started event in the new part of the log
+  tail -c +$((OFF + 1)) "$LOG_FILE" 2>/dev/null | grep '^{' |
+    jq -r 'select((.type // .event // "") == "thread.started") | .thread_id // empty' 2>/dev/null |
+    head -1
+}
+
+is_usage_limit() {
+  local chunk="$1"
+  [ -n "$chunk" ] || return 1
+  grep -qi "usage.*limit" <<<"$chunk" || return 1
+  local found
+  found="$(grep "^{" <<<"$chunk" | jq -r '
+    select((.type // .event // "") | test("^(error|turn\\.failed)$"; "i")) |
+    select(
+      ((.message // "") | test("usage limit"; "i")) or
+      ((.error.message // "") | test("usage limit"; "i")) or
+      ((.error // "") | (if type == "string" then test("usage limit"; "i") else false end)) or
+      ((.codex_error_info // "") == "usage_limit_exceeded") or
+      (tostring | test("usage limit"; "i"))
+    ) | "yes"
+  ' 2>/dev/null | head -1)"
+  if [ "$found" = "yes" ]; then
+    return 0
+  fi
+  if grep -qiE "^(error:?|\[error\]).*usage.*limit" <<<"$chunk"; then
+    return 0
+  fi
+  return 1
+}
+
+is_auth_error() {
+  local chunk="$1"
+  [ -n "$chunk" ] || return 1
+  grep -qiE "$AUTH_RE" <<<"$chunk" || return 1 # cheap pre-filter before parsing
+  {
+    grep '^{' <<<"$chunk" | jq -r '
+      select((.type // .event // "") | test("^(error|turn\\.failed)$")) |
+      (.message // .error.message // "")' 2>/dev/null
+    grep -v '^{' <<<"$chunk"
+  } | grep -qiE "$AUTH_RE"
+}
+
+extract_usage_message() {
+  local chunk="$1"
+  local msg
+  msg="$(grep '^{' <<<"$chunk" | jq -r '
+    select((.type // .event // "") | test("^(error|turn\\.failed)$"; "i")) |
+    select(tostring | test("usage limit"; "i")) |
+    (.message // .error.message // .error // tostring)
+  ' 2>/dev/null | head -1)"
+  if [ -n "$msg" ]; then
+    printf '%s\n' "$msg"
+  else
+    grep -i 'usage.*limit' <<<"$chunk" | head -1
+  fi
+}
+
+# run codex once; returns: 0 finished with SUCCESS | 10 quota | 11 auth | 1 other failure
+run_attempt() {
+  local conv="$1"
+  local prompt="$2"
+  OFF="$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)"
+
+  local cur_dir="$PWD"
+  if [ -n "$conv" ]; then
+    cd "$ADD_DIR" || die "cannot cd to workspace: $ADD_DIR" 1
+    local cmd=(
+      "$CODEXR_BIN" exec resume "$conv" --json
+      -m "$MODEL"
+      -c "model_reasoning_effort=\"$EFFORT\""
+      -c 'cli_auth_credentials_store="file"'
+    )
+    if [ "$YOLO" = 1 ]; then
+      cmd+=(--dangerously-bypass-approvals-and-sandbox)
+    else
+      cmd+=(-c "sandbox_mode=\"$SANDBOX\"")
+    fi
+    cmd+=(-) # the prompt comes on stdin: no argv length limit, and Git Bash cannot rewrite it as a path
+  else
+    local add_dir
+    add_dir="$(platform_arg_path "$ADD_DIR")"
+    local cmd=(
+      "$CODEXR_BIN" exec --json
+      -m "$MODEL"
+      -c "model_reasoning_effort=\"$EFFORT\""
+      -c 'cli_auth_credentials_store="file"'
+      -C "$add_dir"
+    )
+    if [ "$YOLO" = 1 ]; then
+      cmd+=(--dangerously-bypass-approvals-and-sandbox)
+    else
+      cmd+=(--sandbox "$SANDBOX")
+    fi
+    cmd+=(-) # the prompt comes on stdin: no argv length limit, and Git Bash cannot rewrite it as a path
+  fi
+
+  printf '%s\n' "$prompt" >"$PROMPT_TMP"
+  "${PLATFORM_DETACH[@]}" "${cmd[@]}" >>"$LOG_FILE" 2>&1 <"$PROMPT_TMP" &
+  PID=$!
+  if [ -n "$conv" ]; then
+    cd "$cur_dir" 2>/dev/null || true
+  fi
+
+  local chunk
+  while kill -0 "$PID" 2>/dev/null; do
+    chunk="$(tail -c +$((OFF + 1)) "$LOG_FILE" 2>/dev/null)"
+    if is_usage_limit "$chunk"; then
+      stop_codex
+      "$CODEXR" sync >/dev/null 2>&1 || true
+      LAST_CHUNK="$(tail -c +$((OFF + 1)) "$LOG_FILE" 2>/dev/null)"
+      return 10
+    fi
+    if is_auth_error "$chunk"; then
+      stop_codex
+      "$CODEXR" sync >/dev/null 2>&1 || true
+      LAST_CHUNK="$(tail -c +$((OFF + 1)) "$LOG_FILE" 2>/dev/null)"
+      return 11
+    fi
+    sleep "$POLL"
+  done
+  wait "$PID" 2>/dev/null || true
+  "$CODEXR" sync >/dev/null 2>&1 || true
+  chunk="$(tail -c +$((OFF + 1)) "$LOG_FILE" 2>/dev/null)"
+  LAST_CHUNK="$chunk"
+
+  if is_usage_limit "$chunk"; then return 10; fi
+  if is_auth_error "$chunk"; then return 11; fi
+
+  local st
+  st="$(grep '^{' <<<"$chunk" | jq -r -s '
+    map(select(type=="object") | {type: (.type // .event // ""), err: ((.message // .error.message // .error // "") | if type == "string" then . else tostring end)}) |
+    ([to_entries[] | select(.value.type == "turn.completed") | .key] | last) as $last_c |
+    if $last_c == null then
+      "NO_TURN_COMPLETED"
+    else
+      ([to_entries[] | select(.key > $last_c and ((.value.type == "error") or (.value.type == "turn.failed"))) | .value.err] | last) as $later_err |
+      if $later_err != null then
+        "ERROR_AFTER_COMPLETED: " + $later_err
+      else
+        "SUCCESS"
+      end
+    end
+  ' 2>/dev/null)"
+
+  if [ "$st" = "SUCCESS" ]; then
+    return 0
+  fi
+  log "codex ended with status '${st:-NO_RESULT}'; no usage limit message, so no account switch (read the log)"
+  return 1
+}
+
+SWITCHES=0
+IS_FIRST=1
+
+while :; do
+  if [ "$IS_FIRST" = 1 ]; then
+    CURRENT_PROMPT="$ORIG_PROMPT"
+  else
+    if [ -n "$CONV" ]; then
+      CURRENT_PROMPT="$RESUME_NOTE"
+    else
+      CURRENT_PROMPT="$ORIG_PROMPT
+
+NOTE: $RESUME_NOTE"
+    fi
+  fi
+  IS_FIRST=0
+
+  log "running on account '$CUR'${CONV:+ (resume $CONV)}"
+  run_attempt "$CONV" "$CURRENT_PROMPT"
+  rc=$?
+  id="$(thread_id_from_log)"
+  [ -n "$id" ] && CONV="$id"
+
+  case "$rc" in
+    0) log "done (account '$CUR')"; exit 0 ;;
+    11) die "login error on account '$CUR': log in again with 'codex', then 'codexr save $CUR'" 4 ;;
+    10) ;;
+    *) exit 1 ;;
+  esac
+
+  msg="$(extract_usage_message "$LAST_CHUNK")"
+  date_str=""
+  if [[ "$msg" =~ [Tt]ry\ again\ at\ ([^.]+) ]]; then
+    date_str="$(echo "${BASH_REMATCH[1]}" | sed -e 's/[.]$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  fi
+
+  log "account '$CUR' is out of quota (${date_str:-reset time unknown})"
+  if ! "$CODEXR" cooldown "$CUR" >&2; then
+    # codexr could not probe the quota: use "try again at Aug 8th, 2026 5:30 PM" (machine local time), else 5h
+    cd_arg=5h
+    if [ -n "$date_str" ]; then
+      reset_at="$(date -d "$(sed -E 's/([0-9])(st|nd|rd|th)/\1/' <<<"$date_str")" +%s 2>/dev/null || true)"
+      now_s="$(date +%s)"
+      if [[ "$reset_at" =~ ^[0-9]+$ ]] && [ "$reset_at" -gt "$now_s" ]; then cd_arg="$((reset_at - now_s))s"; fi
+    fi
+    "$CODEXR" cooldown "$CUR" "$cd_arg" >&2 || true
+  fi
+
+  SWITCHES=$((SWITCHES + 1))
+  [ "$SWITCHES" -le "$MAX_SWITCH" ] || die "switched accounts $MAX_SWITCH times, stopping" 6
+  if ! NEXT="$("$CODEXR" next -v)"; then
+    die "whole pool is out of quota (conversation ${CONV:-none}); wait for a reset or log in to another account" 5
+  fi
+  "$CODEXR" use "$NEXT" >&2 || die "could not switch to '$NEXT'" 1
+  CUR="$NEXT"
+done

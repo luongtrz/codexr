@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Fake codex-run runner for codex-task tests.
+# Emulates codex-run options: --prompt, --add-dir, --log, --model, --effort, --conversation.
+#
+# Supported knobs:
+#   FAKE_STDOUT_NOISE       string printed to stdout before running
+#   FAKE_PROMPT_COPY        destination path to copy the prompt file to
+#   FAKE_RUN_EDIT           lines of "relpath:content" or "relpath" to create in --add-dir (alias: FAKE_TASK_EDIT)
+#   FAKE_RUN_RM             lines of "relpath" to delete from --add-dir (alias: FAKE_TASK_RM)
+#   FAKE_RUN_COMMIT         when 1, commits changes in --add-dir worktree (alias: FAKE_TASK_COMMIT)
+#   FAKE_STATUS             status in result log: OK (default) or ERROR
+#   FAKE_RESPONSE           agent response message text (default: "Task completed successfully.")
+#   FAKE_NUM_TURNS          number of turns in log (default: 2)
+#   FAKE_TOTAL_TOKENS       total tokens reported in turn usage (default: 12345)
+#   FAKE_CACHED_TOKENS      cached tokens reported in turn usage (default: 0)
+#   FAKE_RUN_EXIT           exit code of fake codex-run (default: 0; alias: FAKE_TASK_EXIT)
+set -uo pipefail
+
+PROMPT="" ADD_DIR="" LOG_FILE="" MODEL="" EFFORT="" CONV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt) PROMPT="${2:-}"; shift 2 ;;
+    --add-dir) ADD_DIR="${2:-}"; shift 2 ;;
+    --log) LOG_FILE="${2:-}"; shift 2 ;;
+    --model) MODEL="${2:-}"; shift 2 ;;
+    --effort) EFFORT="${2:-}"; shift 2 ;;
+    --conversation) CONV="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -n "${FAKE_STDOUT_NOISE:-}" ]; then
+  printf '%s\n' "$FAKE_STDOUT_NOISE"
+fi
+
+if [ -n "${FAKE_PROMPT_COPY:-}" ] && [ -n "$PROMPT" ] && [ -f "$PROMPT" ]; then
+  mkdir -p "$(dirname "$FAKE_PROMPT_COPY")"
+  cp "$PROMPT" "$FAKE_PROMPT_COPY"
+fi
+
+RUN_EDIT="${FAKE_RUN_EDIT:-${FAKE_TASK_EDIT:-}}"
+if [ -n "$RUN_EDIT" ] && [ -n "$ADD_DIR" ]; then
+  while IFS= read -r item || [ -n "$item" ]; do
+    [ -z "$item" ] && continue
+    if [[ "$item" == *:* ]]; then
+      rel="${item%%:*}"
+      content="${item#*:}"
+    else
+      rel="$item"
+      content=""
+    fi
+    mkdir -p "$ADD_DIR/$(dirname "$rel")"
+    printf '%s\n' "$content" > "$ADD_DIR/$rel"
+  done <<< "$RUN_EDIT"
+fi
+
+RUN_RM="${FAKE_RUN_RM:-${FAKE_TASK_RM:-}}"
+if [ -n "$RUN_RM" ] && [ -n "$ADD_DIR" ]; then
+  while IFS= read -r rel || [ -n "$rel" ]; do
+    [ -z "$rel" ] && continue
+    rm -f "$ADD_DIR/$rel"
+  done <<< "$RUN_RM"
+fi
+
+RUN_COMMIT="${FAKE_RUN_COMMIT:-${FAKE_TASK_COMMIT:-0}}"
+if [ "$RUN_COMMIT" = "1" ] && [ -n "$ADD_DIR" ]; then
+  git -C "$ADD_DIR" add -A
+  git -C "$ADD_DIR" -c user.name=t -c user.email=t@t commit -qm fake
+fi
+
+raw_status="${FAKE_STATUS:-OK}"
+if [ "$raw_status" = "SUCCESS" ]; then
+  status="OK"
+else
+  status="$raw_status"
+fi
+
+response="${FAKE_RESPONSE:-Task completed successfully.}"
+turns="${FAKE_NUM_TURNS:-2}"
+tokens="${FAKE_TOTAL_TOKENS:-12345}"
+cached_tokens="${FAKE_CACHED_TOKENS:-0}"
+conv_id="${CONV:-fake-thread-1}"
+
+inp_tokens=$((tokens * 8 / 10))
+out_tokens=$((tokens - inp_tokens))
+
+if [ -n "$LOG_FILE" ]; then
+  mkdir -p "$(dirname "$LOG_FILE")"
+  echo "{\"type\":\"thread.started\",\"thread_id\":\"$conv_id\"}" >> "$LOG_FILE"
+  for ((i=1; i<=turns; i++)); do
+    echo '{"type":"turn.started"}' >> "$LOG_FILE"
+    if [ "$i" -eq "$turns" ]; then
+      jq -c -n --arg resp "$response" '{"type":"item.completed","item":{"type":"agent_message","text":$resp}}' >> "$LOG_FILE"
+      jq -c -n --argjson inp "$inp_tokens" --argjson out "$out_tokens" --argjson cached "$cached_tokens" \
+        '{"type":"turn.completed","usage":{"input_tokens":$inp,"cached_input_tokens":$cached,"output_tokens":$out,"reasoning_output_tokens":0}}' >> "$LOG_FILE"
+      if [ "$status" = "ERROR" ]; then
+        jq -c -n --arg err "$response" '{"type":"turn.failed","message":$err}' >> "$LOG_FILE"
+      fi
+    else
+      echo '{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}' >> "$LOG_FILE"
+    fi
+  done
+fi
+
+exit "${FAKE_RUN_EXIT:-${FAKE_TASK_EXIT:-0}}"

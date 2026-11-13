@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Fake codex binary for tests (emulates codex-cli 0.167.x app-server and exec).
+# Identifies account from $CODEX_HOME/auth.json (refresh_token rt-accN or id_token sub accN).
+#
+# Supported knobs:
+#   FAKE_ARGS_LOG           file where every call appends "account|argv" (argv without prompt)
+#   FAKE_PROMPT_LOG         file where exec appends the prompt text
+#   FAKE_DEAD_TOKENS        accounts whose app-server never answers id 2 and exec fails with login failure
+#   FAKE_ZERO_TOKENS        accounts whose 5h quota is exhausted (rateLimitReachedType set, ordinaryUsageAllowed false)
+#   FAKE_P5                 force the 5h remaining quota percentage for all accounts
+#   FAKE_LOW_TOKENS         accounts with 5% of 5h quota remaining
+#   FAKE_WEEKLY_HIT_TOKENS  accounts whose weekly quota is exhausted
+#   FAKE_WEEK_ORDER         when set, higher account digit resets week earlier (acc3 < acc2 < acc1)
+#   FAKE_HI_SHIFT           when set, each exec call shifts the 5h reset time 10 minutes later
+#   FAKE_REFRESH            when 1, rewrites auth.json with new access_token and rotated refresh_token
+#   FAKE_CROSSTALK_TOKENS   accounts whose call overwrites auth.json with an intruder identity
+#   FAKE_TTY                when 1, modifies terminal mode via stty like the real CLI
+#   FAKE_QUOTA_TOKENS       accounts whose exec prints usage limit error and sleeps 30 (or exits with FAKE_QUOTA_EXIT)
+#   FAKE_QUOTA_EXIT         when 1, exec on a quota-hit account exits 1 immediately instead of sleeping
+#   FAKE_AUTH               when 1, exec fails immediately with a refresh token invalid login error
+#   FAKE_HI_ERROR_TOKENS    accounts whose exec ends in an error and turn.failed event immediately
+#   FAKE_TRANSIENT_ERROR    when 1, exec prints a reconnecting error before completing a successful turn
+set -u
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "fake-codex: jq is required" >&2
+  exit 1
+fi
+
+acct="no-login"
+if [ -n "${CODEX_HOME:-}" ] && [ -f "$CODEX_HOME/auth.json" ]; then
+  raw="$(jq -r '[(.tokens.id_token // ""), (.tokens.refresh_token // ""), (.tokens.account_id // "")] | join("|")' "$CODEX_HOME/auth.json" 2>/dev/null || true)"
+  if [ -n "$raw" ]; then
+    id_tok="${raw%%|*}"
+    rest="${raw#*|}"
+    rf_tok="${rest%%|*}"
+    acc_id="${rest#*|}"
+
+    sub=""
+    if [[ "$id_tok" == *.*.* ]]; then
+      rem="${id_tok#*.}"
+      payload="${rem%%.*}"
+      b64="${payload//-/\+}"
+      b64="${b64//_//}"
+      case "$(( ${#b64} % 4 ))" in
+        2) b64="${b64}==" ;;
+        3) b64="${b64}=" ;;
+      esac
+      sub="$(printf '%s' "$b64" | base64 -d 2>/dev/null | jq -r '.sub // empty' 2>/dev/null || true)"
+    fi
+    if [ -n "$sub" ]; then
+      acct="$sub"
+    elif [ -n "$acc_id" ]; then
+      acct="$acc_id"
+    elif [ -n "$rf_tok" ]; then
+      if [[ "$rf_tok" =~ ^rt-(.*)$ ]]; then
+        acct="${BASH_REMATCH[1]}"
+      else
+        acct="$rf_tok"
+      fi
+    fi
+  fi
+fi
+
+matches_token_list() {
+  local list="${1:-}" item="$2"
+  for x in $list; do
+    if [ "$x" = "$item" ] || [ "$x" = "rt-$item" ] || [ "rt-$x" = "$item" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ "$acct" =~ ([0-9]) ]]; then
+  N="${BASH_REMATCH[1]}"
+else
+  N=0
+fi
+
+subcmd=""
+for arg in "$@"; do
+  case "$arg" in
+    app-server) subcmd="app-server"; break ;;
+    exec) subcmd="exec"; break ;;
+  esac
+done
+
+prompt=""
+args_without_prompt=()
+
+if [ "$subcmd" = "exec" ]; then
+  has_dash=0
+  for a in "$@"; do
+    if [ "$a" = "-" ]; then
+      has_dash=1
+    fi
+  done
+  if [ "$has_dash" = 1 ]; then
+    prompt="$(cat)"
+    for a in "$@"; do
+      if [ "$a" != "-" ]; then
+        args_without_prompt+=("$a")
+      fi
+    done
+  else
+    if [ ! -t 0 ]; then
+      prompt="$(cat)"
+    fi
+    if [ -z "$prompt" ] && [ $# -gt 0 ]; then
+      last="${@: -1}"
+      if [[ "$last" != -* ]]; then
+        prompt="$last"
+        args_without_prompt=("${@:1:$#-1}")
+      else
+        args_without_prompt=("$@")
+      fi
+    else
+      args_without_prompt=("$@")
+    fi
+  fi
+else
+  args_without_prompt=("$@")
+fi
+
+if [ -n "${FAKE_ARGS_LOG:-}" ]; then
+  echo "$acct|${args_without_prompt[*]}" >> "$FAKE_ARGS_LOG"
+fi
+
+if [ -n "${FAKE_PROMPT_LOG:-}" ] && [ "$subcmd" = "exec" ]; then
+  printf '%s\n' "$prompt" >> "$FAKE_PROMPT_LOG"
+fi
+
+if [ "${FAKE_REFRESH:-0}" = 1 ] && [ -n "${CODEX_HOME:-}" ] && [ -f "$CODEX_HOME/auth.json" ]; then
+  tmp="$(mktemp "$CODEX_HOME/auth.json.XXXXXX")"
+  jq --arg at "at-$acct-refreshed" --arg rt "rt-$acct-rotated" \
+    '.tokens.access_token = $at | .tokens.refresh_token = $rt' \
+    "$CODEX_HOME/auth.json" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CODEX_HOME/auth.json"
+fi
+
+if matches_token_list "${FAKE_CROSSTALK_TOKENS:-}" "$acct" && [ -n "${CODEX_HOME:-}" ] && [ -f "$CODEX_HOME/auth.json" ]; then
+  intruder_jwt="eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.$(printf '{"sub":"intruder"}' | base64 | tr -d '=' | tr '/+' '_-')."
+  tmp="$(mktemp "$CODEX_HOME/auth.json.XXXXXX")"
+  jq -n --arg jwt "$intruder_jwt" '{
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: $jwt,
+      access_token: "at-intruder",
+      refresh_token: "rt-intruder",
+      account_id: "intruder"
+    },
+    last_refresh: "2026-01-01T00:00:00Z"
+  }' > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$CODEX_HOME/auth.json"
+fi
+
+if [ "${FAKE_TTY:-0}" = 1 ]; then
+  stty -icanon -echo </dev/tty >/dev/null 2>&1 || true
+fi
+
+if [ "$subcmd" = "app-server" ]; then
+  now="${CODEXR_NOW:-$(date +%s)}"
+
+  shift5=0
+  if [ "${FAKE_HI_SHIFT:-0}" = 1 ] && [ -n "${FAKE_ARGS_LOG:-}" ] && [ -f "$FAKE_ARGS_LOG" ]; then
+    used="$(grep -F -- "$acct|" "$FAKE_ARGS_LOG" 2>/dev/null | grep -c "exec" || true)"
+    if [ "$used" -gt 0 ]; then
+      shift5=$((used * 600))
+    fi
+  fi
+  r5=$((now + 18000 + shift5))
+
+  wk=259200
+  if [ "${FAKE_WEEK_ORDER:-0}" = 1 ]; then
+    wk=$((259200 + (9 - N) * 3600))
+  fi
+  rw=$((now + wk))
+
+  p5_left=$((50 + N * 10))
+  pw_left=$((40 + N * 10))
+
+  if matches_token_list "${FAKE_ZERO_TOKENS:-}" "$acct"; then
+    p5_left=0
+  fi
+  if [[ "${FAKE_P5:-}" =~ ^[0-9]+$ ]]; then
+    p5_left="$FAKE_P5"
+  fi
+  if matches_token_list "${FAKE_LOW_TOKENS:-}" "$acct"; then
+    p5_left=5
+  fi
+  if matches_token_list "${FAKE_WEEKLY_HIT_TOKENS:-}" "$acct"; then
+    pw_left=0
+  fi
+
+  [ "$p5_left" -ge 0 ] || p5_left=0
+  [ "$p5_left" -le 100 ] || p5_left=100
+  [ "$pw_left" -ge 0 ] || pw_left=0
+  [ "$pw_left" -le 100 ] || pw_left=100
+
+  primary_used=$((100 - p5_left))
+  secondary_used=$((100 - pw_left))
+
+  if [ "$p5_left" -le 0 ] || [ "$pw_left" -le 0 ] || matches_token_list "${FAKE_ZERO_TOKENS:-}" "$acct" || matches_token_list "${FAKE_WEEKLY_HIT_TOKENS:-}" "$acct"; then
+    rlrt_json='"rate_limit_reached"'
+    oua_json=false
+  else
+    rlrt_json=null
+    oua_json=true
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ \"id\":[[:space:]]*1[,\}] ]]; then
+      echo '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex","version":"0.167.2"}}}'
+    elif [[ "$line" =~ \"id\":[[:space:]]*2[,\}] ]]; then
+      if ! matches_token_list "${FAKE_DEAD_TOKENS:-}" "$acct"; then
+        jq -c -n \
+          --argjson p_used "$primary_used" \
+          --argjson p_reset "$r5" \
+          --argjson s_used "$secondary_used" \
+          --argjson s_reset "$rw" \
+          --arg plan "plus" \
+          --argjson rlrt "$rlrt_json" \
+          --argjson oua "$oua_json" \
+          '{jsonrpc:"2.0",id:2,result:{rateLimits:{primary:{usedPercent:$p_used,windowDurationMins:300,resetsAt:$p_reset},secondary:{usedPercent:$s_used,windowDurationMins:10080,resetsAt:$s_reset},planType:$plan,rateLimitReachedType:$rlrt},ordinaryUsageAllowed:$oua}}'
+      fi
+    fi
+  done
+  exit 0
+fi
+
+if [ "$subcmd" = "exec" ]; then
+  tid="fake-thread-1"
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "resume" ]; then
+      tid="$a"
+    fi
+    prev="$a"
+  done
+
+  if [ "${FAKE_AUTH:-0}" = 1 ]; then
+    echo '{"type":"error","message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}'
+    exit 1
+  fi
+
+  if matches_token_list "${FAKE_DEAD_TOKENS:-}" "$acct"; then
+    echo '{"type":"error","message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}'
+    exit 1
+  fi
+
+  if matches_token_list "${FAKE_QUOTA_TOKENS:-}" "$acct"; then
+    echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
+    echo '{"type":"error","message":"You'\''ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 8th, 2026 5:30 PM."}'
+    echo '{"type":"turn.failed","message":"You'\''ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 8th, 2026 5:30 PM."}'
+    if [ "${FAKE_QUOTA_EXIT:-0}" = 1 ]; then
+      exit 1
+    fi
+    sleep 30
+    exit 1
+  fi
+
+  if matches_token_list "${FAKE_HI_ERROR_TOKENS:-}" "$acct"; then
+    echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
+    echo '{"type":"turn.started"}'
+    echo '{"type":"error","message":"You'\''ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 8th, 2026 5:30 PM."}'
+    echo '{"type":"turn.failed","message":"You'\''ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Aug 8th, 2026 5:30 PM."}'
+    exit 1
+  fi
+
+  if [ "${FAKE_TRANSIENT_ERROR:-0}" = 1 ]; then
+    echo '{"type":"error","message":"Reconnecting... 1/5"}'
+  fi
+
+  echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
+  echo '{"type":"turn.started"}'
+  echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}'
+  exit 0
+fi
+
+if [[ " $* " =~ " --version " ]]; then
+  echo "codex 0.167.2"
+  exit 0
+fi
+
+exit 0

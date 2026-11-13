@@ -1,0 +1,2 @@
+# scripts are run by bash (also on Windows): keep LF whatever core.autocrlf says
+* text=auto eol=lf
