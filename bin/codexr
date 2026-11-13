@@ -760,7 +760,7 @@ term_width() {
 
 print_table() {
   local failed=" $1 " live="$2" t cur n snap p5 r5 pw rw at plan until st sc oldest=0 mark
-  t="$(now)"; cur="$(active_name)"
+  t="$(now)"; cur="$(real_owner)"
 
   local G="" Y="" R="" Z="" usecolor=0
   case "${CODEXR_COLOR:-auto}" in

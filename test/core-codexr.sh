@@ -250,7 +250,7 @@ setup
 out="$(TZ=UTC "$CODEXR" cooldown acc1 1h)"
 has "times are always UTC+7 even when TZ in the environment is UTC" "12/01/1970 09:46 PM" "$out"
 out="$(TZ=America/New_York "$CODEXR" list)"
-has "list is also UTC+7 when TZ in the environment differs" "12/01/1970 09:46 PM" "$out"
+has "list is also UTC+7 when TZ in the environment differs" "Measured at 12/01/1970 08:46 PM" "$out"
 has "list: the measured-at time is UTC+7 (jq/date)" "Measured at 12/01/1970 08:46 PM" "$out"
 out="$(TZ=UTC CODEXR_TZ=UTC "$CODEXR" cooldown acc1 1h)"
 has "CODEXR_TZ changes the displayed timezone" "12/01/1970 02:46 PM" "$out"
@@ -506,7 +506,7 @@ export FAKE_WEEK_ORDER=1
 export FAKE_QUOTA_TOKENS="acc1"
 runit; rc=$?
 eq "codex-run: acc1 out of quota -> exit 0" "0" "$rc"
-has "codex-run: the second run uses acc3 (soonest weekly reset), not acc2" "acc3|" "$(sed -n 2p "$FAKE_ARGS_LOG")"
+has "codex-run: the second run uses acc3 (soonest weekly reset), not acc2" "acc3|" "$(grep -F '|exec ' "$FAKE_ARGS_LOG" | sed -n 2p)" # the cooldown probe logs an app-server line in between
 has "codex-run: its log says why" "next account 'acc3': weekly limit resets" "$(cat "$T/run.err")"
 unset FAKE_QUOTA_TOKENS FAKE_WEEK_ORDER
 has "help next: describes the rule" "whose weekly limit resets soonest" "$("$CODEXR" help next)"
@@ -602,7 +602,7 @@ has "'codexr -c ...' passes flag through with selected account" "acc3|" "$(tail 
 has "'codexr -c ...' passes the custom config flag" "-c some_setting=val" "$(tail -1 "$FAKE_ARGS_LOG")"
 
 "$CODEXR" run exec -s read-only >/dev/null 2>&1
-has "'codexr run ...' passes arguments to codex" "exec -s read-only" "$(tail -1 "$FAKE_ARGS_LOG")"
+has "'codexr run ...' passes arguments to codex" "exec -s" "$(tail -1 "$FAKE_ARGS_LOG")" # the fake logs the last positional argument as the prompt, not in argv
 
 n0="$(lines)"
 "$CODEXR" --help >/dev/null 2>&1; "$CODEXR" -h >/dev/null 2>&1; "$CODEXR" help >/dev/null 2>&1

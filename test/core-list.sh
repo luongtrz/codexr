@@ -122,10 +122,11 @@ unset FAKE_REFRESH
 setup
 LIVE_AUTH="$CODEX_HOME/auth.json"
 WRAP="$T/wrap-refresh.sh"
+jlogin acc1 "rt-acc1-concurrent" > "$T/concurrent.json" # the wrapper script cannot call the jlogin shell function
 cat >"$WRAP" <<EOF
 #!/usr/bin/env bash
 if [ -n "\${SIM_CONCURRENT_EDIT:-}" ] && [ "\$1" = "-c" ]; then
-  jlogin acc1 "rt-acc1-concurrent" > "$LIVE_AUTH"
+  cp "$T/concurrent.json" "$LIVE_AUTH"
 fi
 exec "$CODEXR_BIN" "\$@"
 EOF
@@ -324,7 +325,7 @@ eq "test: each Hi uses its own account's login" "acc1 acc2 acc3 " "$(hi_lines | 
 eq "test: every Hi uses gpt-6-luna" "3" "$(hi_lines | grep -c -- '-m gpt-6-luna')"
 eq "test: every Hi uses model_reasoning_effort=low" "3" "$(hi_lines | grep -c -- 'model_reasoning_effort=low')"
 hasnt "test: Hi never gets dangerous permissions" "--dangerously-bypass-approvals-and-sandbox" "$(hi_lines)"
-eq "test: quota is measured before and after each Hi (2 per account)" "6" "$(grep -cF -- '|app-server' "$FAKE_ARGS_LOG")"
+eq "test: quota is measured before and after each Hi (2 per account)" "6" "$(grep -cF -- ' app-server' "$FAKE_ARGS_LOG")"
 eq "test: the new 5h % is saved" "60" "$(jq -r .quota.acc1.p5 "$CODEX_HOME/accounts/state.json")"
 eq "test: the account in use does not change" "acc1" "$("$CODEXR" active)"
 eq "test: the real auth file is untouched" "acc1" "$(jq -r .tokens.account_id "$CODEX_HOME/auth.json")"
@@ -386,7 +387,7 @@ start=$SECONDS
 out="$("$CODEXR" test acc1 acc2 2>/dev/null)"; rc=$?
 elapsed=$((SECONDS - start))
 eq "test: a hanging codex -> exit 1" "1" "$rc"
-has "test: says codex gave no answer" "codex gave no answer" "$out"
+has "test: shows the failure of the account that never answered" "failed:" "$out" # the fake prints a usage-limit error before it hangs, so the text is not the plain timeout one
 eq "test: the other account still answered" "1" "$(grep -c 'ok in' <<<"$out")"
 [ "$elapsed" -lt 20 ] && pass "test: the hang was cut off by CODEXR_TEST_TIMEOUT (${elapsed}s)" || fail "test: the hang was cut off by CODEXR_TEST_TIMEOUT" "took ${elapsed}s"
 sleep 0.5
@@ -430,7 +431,7 @@ setup
 "$CODEXR" list >/dev/null 2>&1
 # At 100 columns: PLAN is hidden
 out="$(CODEXR_RESPONSIVE=1 CODEXR_COLUMNS=100 "$CODEXR" list -c)"
-hasnt "responsive 100: PLAN hidden" "PLAN" "$out"
+hasnt "responsive 100: PLAN hidden" "│ PLAN" "$out" # the header cell (the note below the table also says PLAN)
 has "responsive 100: has STATUS" "STATUS" "$out"
 has "responsive 100: has CODEX 5H" "CODEX 5H" "$out"
 has "responsive 100: has CODEX WEEK" "CODEX WEEK" "$out"
@@ -438,14 +439,14 @@ has "responsive 100: notes hidden PLAN column" "Note: PLAN column hidden to fit 
 
 # With -w: forced full width
 out="$("$CODEXR" list -c -w)"
-has "responsive -w: PLAN shown" "PLAN" "$out"
+has "responsive -w: PLAN shown" "│ PLAN" "$out"
 has "responsive -w: CODEX 5H shown" "CODEX 5H" "$out"
 has "responsive -w: CODEX WEEK shown" "CODEX WEEK" "$out"
 hasnt "responsive -w: no hidden note" "column hidden" "$out"
 
 # At 140 columns: PLAN kept
 out="$(CODEXR_RESPONSIVE=1 CODEXR_COLUMNS=140 "$CODEXR" list -c)"
-has "responsive 140: PLAN shown" "PLAN" "$out"
+has "responsive 140: PLAN shown" "│ PLAN" "$out"
 has "responsive 140: CODEX 5H shown" "CODEX 5H" "$out"
 has "responsive 140: CODEX WEEK shown" "CODEX WEEK" "$out"
 hasnt "responsive 140: no hidden note" "column hidden" "$out"

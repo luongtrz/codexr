@@ -1,3 +1,8 @@
+# codex-run's cooldown also probes the quota (codexr cooldown -> app-server), so the args log holds app-server lines too:
+# these views keep only the exec calls
+xlog() { grep -F '|exec ' "$FAKE_ARGS_LOG"; }
+xlines() { xlog | wc -l | tr -d ' '; }
+
 # Core tests for codex-run and concurrency.
 # Sourced by test/core.sh from test/run.sh.
 
@@ -8,8 +13,8 @@ setup
 export FAKE_PROMPT_LOG="$T/prompt.log"
 runit; rc=$?
 eq "immediate success: exit 0" "0" "$rc"
-eq "runs only once" "1" "$(lines)"
-first="$(sed -n 1p "$FAKE_ARGS_LOG")"
+eq "runs only once" "1" "$(xlines)"
+first="$(xlog | sed -n 1p)"
 has "uses the acc1 account" "acc1|" "$first"
 has "carries -m gpt-6-luna" "-m gpt-6-luna" "$first"
 has "carries -c model_reasoning_effort=\"max\"" '-c model_reasoning_effort="max"' "$first"
@@ -18,14 +23,14 @@ has "carries -C <workdir>" "-C $T/work" "$first"
 has "default sandbox workspace-write" "--sandbox workspace-write" "$first"
 eq "prompt reaches codex on stdin (FAKE_PROMPT_LOG)" "do the thing" "$(cat "$FAKE_PROMPT_LOG")"
 hasnt "logged argv has no prompt" "do the thing" "$first"
-eq "logged argv ends with -" "-" "$(awk '{print $NF}' "$FAKE_ARGS_LOG")"
+eq "logged argv ends with -" "-" "$(xlog | awk '{print $NF}')"
 unset FAKE_PROMPT_LOG
 
 # Custom --model and --effort flags
 setup
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --model custom-model --effort low 2>"$T/run.err"; rc=$?
 eq "codex-run with custom model and effort: exit 0" "0" "$rc"
-first="$(sed -n 1p "$FAKE_ARGS_LOG")"
+first="$(xlog | sed -n 1p)"
 has "passes custom --model" "-m custom-model" "$first"
 has "passes custom --effort" '-c model_reasoning_effort="low"' "$first"
 
@@ -33,12 +38,12 @@ has "passes custom --effort" '-c model_reasoning_effort="low"' "$first"
 setup
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --sandbox read-only 2>"$T/run.err"; rc=$?
 eq "codex-run --sandbox read-only: exit 0" "0" "$rc"
-has "passes --sandbox read-only" "--sandbox read-only" "$(cat "$FAKE_ARGS_LOG")"
+has "passes --sandbox read-only" "--sandbox read-only" "$(xlog)"
 
 setup
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --yolo 2>"$T/run.err"; rc=$?
 eq "codex-run --yolo: exit 0" "0" "$rc"
-first="$(sed -n 1p "$FAKE_ARGS_LOG")"
+first="$(xlog | sed -n 1p)"
 has "passes --yolo flag" "--dangerously-bypass-approvals-and-sandbox" "$first"
 hasnt "--yolo omits --sandbox" "--sandbox" "$first"
 
@@ -49,8 +54,8 @@ start=$SECONDS
 runit; rc=$?
 elapsed=$((SECONDS - start))
 eq "acc1 out of quota -> switch to acc2, exit 0" "0" "$rc"
-eq "runs twice" "2" "$(lines)"
-second="$(sed -n 2p "$FAKE_ARGS_LOG")"
+eq "runs twice" "2" "$(xlines)"
+second="$(xlog | sed -n 2p)"
 has "second run uses the acc2 account" "acc2|" "$second"
 has "second run resumes the same thread id" "exec resume fake-thread-1" "$second"
 has "resumed attempt uses -c sandbox_mode" '-c sandbox_mode="workspace-write"' "$second"
@@ -75,7 +80,7 @@ setup
 export FAKE_QUOTA_TOKENS="acc1" FAKE_QUOTA_EXIT=1
 runit; rc=$?
 eq "quota with immediate exit 1: switch to acc2, exit 0" "0" "$rc"
-eq "quota with immediate exit 1: runs twice" "2" "$(lines)"
+eq "quota with immediate exit 1: runs twice" "2" "$(xlines)"
 eq "quota with immediate exit 1: active = acc2" "acc2" "$("$CODEXR" active)"
 eq "quota with immediate exit 1: log shows thread.started twice" "2" "$(grep -c '"type":"thread.started"' "$T/run.jsonl")"
 eq "quota with immediate exit 1: both thread.started have same id" "fake-thread-1 fake-thread-1" "$(jq -r 'select((.type // "") == "thread.started") | .thread_id' "$T/run.jsonl" | xargs)"
@@ -86,7 +91,7 @@ setup
 export FAKE_QUOTA_TOKENS="acc1"
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --sandbox read-only 2>"$T/run.err"; rc=$?
 eq "resumed with read-only sandbox: exit 0" "0" "$rc"
-second="$(sed -n 2p "$FAKE_ARGS_LOG")"
+second="$(xlog | sed -n 2p)"
 has "resumed read-only uses -c sandbox_mode=\"read-only\"" '-c sandbox_mode="read-only"' "$second"
 hasnt "resumed read-only omits -C" "-C $T/work" "$second"
 hasnt "resumed read-only omits --sandbox" "--sandbox" "$second"
@@ -97,7 +102,7 @@ setup
 export FAKE_QUOTA_TOKENS="acc1"
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --yolo 2>"$T/run.err"; rc=$?
 eq "resumed with yolo: exit 0" "0" "$rc"
-second="$(sed -n 2p "$FAKE_ARGS_LOG")"
+second="$(xlog | sed -n 2p)"
 has "resumed yolo uses --dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-approvals-and-sandbox" "$second"
 hasnt "resumed yolo omits -C" "-C $T/work" "$second"
 hasnt "resumed yolo omits sandbox_mode" "sandbox_mode" "$second"
@@ -108,9 +113,9 @@ setup
 export FAKE_QUOTA_TOKENS="acc1 acc2"
 runit; rc=$?
 eq "two accounts in a row out of quota -> exit 0" "0" "$rc"
-eq "runs three times" "3" "$(lines)"
-has "third run uses acc3" "acc3|" "$(sed -n 3p "$FAKE_ARGS_LOG")"
-has "third run still resumes the same conversation" "exec resume fake-thread-1" "$(sed -n 3p "$FAKE_ARGS_LOG")"
+eq "runs three times" "3" "$(xlines)"
+has "third run uses acc3" "acc3|" "$(xlog | sed -n 3p)"
+has "third run still resumes the same conversation" "exec resume fake-thread-1" "$(xlog | sed -n 3p)"
 unset FAKE_QUOTA_TOKENS
 
 # Whole pool out of quota -> exit 5
@@ -136,7 +141,7 @@ export FAKE_AUTH=1
 runit; rc=$?
 eq "auth error -> exit 4" "4" "$rc"
 eq "auth error: account is not switched" "acc1" "$("$CODEXR" active)"
-eq "auth error: runs only once" "1" "$(lines)"
+eq "auth error: runs only once" "1" "$(xlines)"
 has "auth error message names the account" "login error on account 'acc1'" "$(cat "$T/run.err")"
 unset FAKE_AUTH
 
@@ -145,21 +150,21 @@ setup
 rm -f "$CODEX_HOME/accounts/state.json" "$CODEX_HOME/auth.json"
 runit; rc=$?
 eq "no active account -> exit 4" "4" "$rc"
-eq "codex is not run when there is no active account" "0" "$(lines)"
+eq "codex is not run when there is no active account" "0" "$(xlines)"
 
 # Old usage limit in log is not counted again
 setup
 echo '{"type":"error","message":"You'\''ve hit your usage limit. try again at Aug 8th, 2026 5:30 PM."}' >"$T/run.jsonl"
 runit; rc=$?
 eq "an old usage limit line in the log is not counted again" "0" "$rc"
-eq "old log: runs only once" "1" "$(lines)"
+eq "old log: runs only once" "1" "$(xlines)"
 
 # Transient error before completed turn is a success
 setup
 export FAKE_TRANSIENT_ERROR=1
 runit; rc=$?
 eq "transient error before successful turn: exit 0" "0" "$rc"
-eq "transient error: runs only once" "1" "$(lines)"
+eq "transient error: runs only once" "1" "$(xlines)"
 unset FAKE_TRANSIENT_ERROR
 
 # Refreshed token is synced back to account slot after run
@@ -186,14 +191,14 @@ setup
 CODEX_RUN_SANDBOX=invalid "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" 2>/dev/null; eq "invalid CODEX_RUN_SANDBOX -> exit 2" "2" "$?"
 CODEX_RUN_SANDBOX=read-only runit; rc=$?
 eq "CODEX_RUN_SANDBOX default env applied: exit 0" "0" "$rc"
-has "CODEX_RUN_SANDBOX default passed to codex" "--sandbox read-only" "$(cat "$FAKE_ARGS_LOG")"
+has "CODEX_RUN_SANDBOX default passed to codex" "--sandbox read-only" "$(xlog)"
 
 # Explicit --conversation flag
 setup
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --conversation "conv-custom-123" 2>"$T/run.err"; rc=$?
 eq "codex-run --conversation: exit 0" "0" "$rc"
-eq "codex-run --conversation: runs once" "1" "$(lines)"
-first="$(sed -n 1p "$FAKE_ARGS_LOG")"
+eq "codex-run --conversation: runs once" "1" "$(xlines)"
+first="$(xlog | sed -n 1p)"
 has "codex-run --conversation: first call resumes conversation" "exec resume conv-custom-123" "$first"
 has "codex-run --conversation: uses -c sandbox_mode" '-c sandbox_mode="workspace-write"' "$first"
 
@@ -201,9 +206,9 @@ setup
 export FAKE_QUOTA_TOKENS="acc1"
 "$RUN" --prompt "$T/prompt.txt" --add-dir "$T/work" --log "$T/run.jsonl" --conversation "conv-custom-123" 2>"$T/run.err"; rc=$?
 eq "codex-run --conversation with 429: exit 0" "0" "$rc"
-eq "codex-run --conversation with 429: runs twice" "2" "$(lines)"
-first="$(sed -n 1p "$FAKE_ARGS_LOG")"
-second="$(sed -n 2p "$FAKE_ARGS_LOG")"
+eq "codex-run --conversation with 429: runs twice" "2" "$(xlines)"
+first="$(xlog | sed -n 1p)"
+second="$(xlog | sed -n 2p)"
 has "codex-run --conversation with 429: first call carries resume conv-custom-123" "exec resume conv-custom-123" "$first"
 has "codex-run --conversation with 429: second call keeps resuming same conversation" "exec resume conv-custom-123" "$second"
 unset FAKE_QUOTA_TOKENS
@@ -236,8 +241,8 @@ mk12
 export FAKE_QUOTA_TOKENS="a01 a02 a03 a04 a05 a06 a07 a08 a09 a10"
 runit; rc=$?
 eq "10 exhausted accounts -> 10 switches are allowed by default, the 11th account answers (exit 0)" "0" "$rc"
-eq "that took 11 runs" "11" "$(lines)"
-has "the last run used a11" "a11|" "$(tail -1 "$FAKE_ARGS_LOG")"
+eq "that took 11 runs" "11" "$(xlines)"
+has "the last run used a11" "a11|" "$(xlog | tail -1)"
 
 mk12
 export FAKE_QUOTA_TOKENS="a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11"

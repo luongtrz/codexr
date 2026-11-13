@@ -98,11 +98,7 @@ if [ "$subcmd" = "exec" ]; then
   done
   if [ "$has_dash" = 1 ]; then
     prompt="$(cat)"
-    for a in "$@"; do
-      if [ "$a" != "-" ]; then
-        args_without_prompt+=("$a")
-      fi
-    done
+    args_without_prompt=("$@") # the "-" stdin marker stays in the logged argv: the prompt itself never does
   else
     if [ ! -t 0 ]; then
       prompt="$(cat)"
