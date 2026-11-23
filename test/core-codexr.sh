@@ -572,14 +572,14 @@ setup
 eq "plain 'codexr' starts codex once" "1" "$(lines)"
 has "plain 'codexr': uses the selected account" "acc1|" "$(cat "$FAKE_ARGS_LOG")"
 has "plain 'codexr': passes -c cli_auth_credentials_store=file" "-c cli_auth_credentials_store=file" "$(cat "$FAKE_ARGS_LOG")"
-has "plain 'codexr': passes default model gpt-6-luna" "-m gpt-6-luna" "$(cat "$FAKE_ARGS_LOG")"
+has "plain 'codexr': passes default model gpt-6.1-terra" "-m gpt-6.1-terra" "$(cat "$FAKE_ARGS_LOG")"
 has "plain 'codexr': passes default effort xhigh" "-c model_reasoning_effort=xhigh" "$(cat "$FAKE_ARGS_LOG")"
 
 # Override model
 setup
 "$CODEXR" -m custom-model >/dev/null 2>&1
 has "plain 'codexr': custom -m is passed" "-m custom-model" "$(cat "$FAKE_ARGS_LOG")"
-hasnt "plain 'codexr': default model omitted when -m given" "-m gpt-6-luna" "$(cat "$FAKE_ARGS_LOG")"
+hasnt "plain 'codexr': default model omitted when -m given" "-m gpt-6.1-terra" "$(cat "$FAKE_ARGS_LOG")"
 
 # Override effort
 setup

@@ -172,7 +172,7 @@ On exit 4 (login), stop and tell the user to log in again. On exit 5, stop and r
 |---|---|---|
 | `CODEX_HOME` | `~/.codex` | codex home directory |
 | `CODEXR_BIN` | `codex` | codex binary |
-| `CODEXR_MODEL` | `gpt-6-luna` | default model for codex-run and codex-task |
+| `CODEXR_MODEL` | `gpt-6.1-terra` | default model for codex-run and codex-task |
 | `CODEXR_EFFORT` | `max` | default reasoning effort for codex-run and codex-task |
 | `CODEXR_TZ` | `UTC-7` (UTC+7) | time zone for displayed times |
 | `CODEXR_COLOR` | `auto` | `auto`, `always` or `never` |
